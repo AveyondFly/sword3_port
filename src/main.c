@@ -175,11 +175,9 @@ static void sw_cpu_performance(void) {
   }
 }
 
-/* 手柄三键分开，互不复用：
- *   A 确认：原样交给游戏 UpdateJoystick*
- *   B 返回：只置 BACK_KEY_CLICK（TakeKey → UndoCommand），不兼开菜单
- *   X 菜单：注入右键。原始端口 B=右键，大地图任意位置右键开系统菜单，不用点图标。
- * Start 不进菜单，只留 SELECT+START 退出。 */
+/* A 确认：原样交给游戏。
+ * B：战斗只置 BACK_KEY_CLICK；野外/菜单按住=右键按住、松开=右键松开（原始端口）。
+ * X 不拦。Start 只留 SELECT+START 退出。 */
 #define SW_CMD_BTN_STRIDE 0x60
 #define SW_BTN_ITEM_ID    88
 #define SW_BTN_CLICKED    56
@@ -360,29 +358,10 @@ static void sw_hook_uigamepad(void) {
   }
 }
 
-/* 游戏大地图开关系统菜单都是右键。X 只开、B 只关，避免同一颗键进出。
- * isShowMenu 在野外 HUD 上常年是 1，不能用来判断是否已在系统菜单里。 */
-static int sw_opened_sysmenu;
-static int sw_saw_game_menu;
-
-static void sw_pad_log(const char *s) {
-  (void)!write(STDERR_FILENO, s, strlen(s));
-}
-
-static int sw_game_in_system_menu(void) {
-  int *in_sys = sw_sym("inMenuSystem");
-  void **fmm = sw_sym("fMouseMain");
-  void *sysmm = sw_sym("_Z12SystemMMousev");
-
-  if (in_sys && *in_sys)
-    return 1;
-  if (fmm && sysmm && *fmm == sysmm)
-    return 1;
-  return 0;
-}
-
-static int sw_in_system_menu(void) {
-  return sw_game_in_system_menu() || sw_opened_sysmenu;
+/* 原始端口 B=右键。战斗返回是 2023 so 的 BACK_KEY_CLICK，两套不能叠在同一下。 */
+static int sw_in_fight(void) {
+  unsigned char *f = sw_sym("inFight");
+  return f && *f;
 }
 
 static void sw_push_right_click(int down) {
@@ -402,68 +381,23 @@ static void sw_push_right_click(int down) {
   SDL_PushEvent(&e);
 }
 
-static void sw_inject_right_click(void) {
-  static Uint32 last;
-  Uint32 now = SDL_GetTicks();
-  void *in = sw_sym("DINPUT");
-  void (*upd)(void *, int, int);
-
-  if (last && now - last < 400)
-    return;
-  last = now;
-
-  if (in) {
-    ((unsigned char *)in)[1193] = 0x80;
-    upd = (void (*)(void *, int, int))sw_sym(
-        "_ZN8SDLINPUT15UpdateKeyStatusE12SDL_Scancodeb");
-    if (upd)
-      upd(in, 3, 1);
-  }
-  sw_push_right_click(1);
-  sw_push_right_click(0);
-  if (in) {
-    ((unsigned char *)in)[1193] = 0;
-    upd = (void (*)(void *, int, int))sw_sym(
-        "_ZN8SDLINPUT15UpdateKeyStatusE12SDL_Scancodeb");
-    if (upd)
-      upd(in, 3, 0);
-  }
-}
-
-static void sw_open_system_menu(void) {
-  if (sw_in_system_menu())
-    return;
-  sw_pad_log("[pad] X -> open system menu\n");
-  sw_inject_right_click();
-  sw_opened_sysmenu = 1;
-  sw_saw_game_menu = 0;
-}
-
-/* B：战斗走 BACK_KEY_CLICK；系统菜单里再补一次右键，对应游戏自己的退出。 */
-static void sw_psv_cancel(void) {
-  unsigned char *bk = sw_sym("BACK_KEY_CLICK");
-  if (bk)
-    *bk = 1;
-  if (sw_in_system_menu()) {
-    sw_pad_log("[pad] B -> close system menu\n");
-    sw_inject_right_click();
-    sw_opened_sysmenu = 0;
-    sw_saw_game_menu = 0;
-  }
-}
-
 int sw_SDL_PollEvent(SDL_Event *ev) {
   int r = SDL_PollEvent(ev);
   if (r > 0 &&
       (ev->type == SDL_CONTROLLERBUTTONDOWN ||
        ev->type == SDL_CONTROLLERBUTTONUP)) {
     if (ev->cbutton.button == SDL_CONTROLLER_BUTTON_B) {
-      if (ev->type == SDL_CONTROLLERBUTTONDOWN)
-        sw_psv_cancel();
-      ev->cbutton.button = (Uint8)-1;
-    } else if (ev->cbutton.button == SDL_CONTROLLER_BUTTON_X) {
-      if (ev->type == SDL_CONTROLLERBUTTONDOWN)
-        sw_open_system_menu();
+      int down = ev->type == SDL_CONTROLLERBUTTONDOWN;
+      if (sw_in_fight()) {
+        if (down) {
+          unsigned char *bk = sw_sym("BACK_KEY_CLICK");
+          if (bk)
+            *bk = 1;
+        }
+      } else {
+        /* 与原始端口相同：B 按下=右键按下，松开=右键松开，不能同一帧脉冲。 */
+        sw_push_right_click(down);
+      }
       ev->cbutton.button = (Uint8)-1;
     } else if (ev->cbutton.button == SDL_CONTROLLER_BUTTON_START) {
       ev->cbutton.button = (Uint8)-1;
@@ -476,7 +410,6 @@ int sw_SDL_PollEvent(SDL_Event *ev) {
 static void *sw_input_thread(void *arg) {
   (void)arg;
   SDL_GameController *pad = NULL;
-  int prev_x = 0, prev_b = 0;
   for (;;) {
     SDL_GameControllerUpdate();
     if (!pad) {
@@ -495,24 +428,10 @@ static void *sw_input_thread(void *arg) {
     if (pad) {
       int start = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_START);
       int back = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_BACK);
-      int x = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_X);
-      int b = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_B);
       if (start && back) {
         static const char msg[] = "[pad] SELECT+START -> exit\n";
         (void)!write(STDERR_FILENO, msg, sizeof(msg) - 1);
         _exit(0);
-      }
-      if (x && !prev_x)
-        sw_open_system_menu();
-      if (b && !prev_b)
-        sw_psv_cancel();
-      prev_x = x;
-      prev_b = b;
-      if (sw_opened_sysmenu && sw_game_in_system_menu())
-        sw_saw_game_menu = 1;
-      if (sw_opened_sysmenu && sw_saw_game_menu && !sw_game_in_system_menu()) {
-        sw_opened_sysmenu = 0;
-        sw_saw_game_menu = 0;
       }
     }
     SDL_Delay(16);
@@ -652,7 +571,7 @@ int main(int argc, char *argv[]) {
   sw_cpu_performance();
   debugPrintf("=== 仙剑奇侠传三 (Sword3) ARM64 so-loader (NextOS) ===\n");
   /* 启动横幅加策略标识：随包 SDL2_image + 部署期 LIBC->WEAK（便于现场日志核对）。 */
-  debugPrintf("[build] %s %s (A=confirm B=back/close X=open)\n",
+  debugPrintf("[build] %s %s (A=confirm B=hold-right / fight-back)\n",
               __DATE__, __TIME__);
 
   /* 1) 设备侧 SDL2 初始化窗口：egl_shim 自动选后端（fbdev/kmsdrm/wayland），
