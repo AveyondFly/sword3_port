@@ -2301,6 +2301,8 @@ static void *my_dlsym(void *handle, const char *name) {
       return (void *)&egl_shim_SDL_CreateRenderer;
     if (!strcmp(name, "SDL_RenderSetLogicalSize"))
       return (void *)&egl_shim_SDL_RenderSetLogicalSize;
+    if (!strcmp(name, "SDL_RenderCopy"))
+      return (void *)&egl_shim_SDL_RenderCopy;
     if (!strcmp(name, "SDL_VideoInit")) return (void *)&egl_shim_SDL_VideoInit;
     if (!strcmp(name, "SDL_AudioInit")) return (void *)&egl_shim_SDL_AudioInit;
     if (!strcmp(name, "SDL_AudioQuit")) return (void *)&egl_shim_SDL_AudioQuit;
@@ -2800,6 +2802,7 @@ DynLibFunction dynlib_functions[] = {
     {"SDL_GetDisplayBounds", (uintptr_t)&egl_shim_SDL_GetDisplayBounds},
     {"SDL_CreateRenderer", (uintptr_t)&egl_shim_SDL_CreateRenderer},
     {"SDL_RenderSetLogicalSize", (uintptr_t)&egl_shim_SDL_RenderSetLogicalSize},
+    {"SDL_RenderCopy", (uintptr_t)&egl_shim_SDL_RenderCopy},
     {"SDL_VideoInit", (uintptr_t)&egl_shim_SDL_VideoInit},
     {"SDL_AudioInit", (uintptr_t)&egl_shim_SDL_AudioInit},
     {"SDL_AudioQuit", (uintptr_t)&egl_shim_SDL_AudioQuit},

@@ -266,6 +266,25 @@ int egl_shim_SDL_RenderSetLogicalSize(void *renderer, int w, int h) {
   return SDL_RenderSetLogicalSize((SDL_Renderer *)renderer, use_w, use_h);
 }
 
+/* ReanderUpdate：Clear → RenderCopy(bg, dst=NULL) → RenderCopy(game, render_rect)。
+ * LogicalSize 把 dst=NULL 也锁在 4:3 里，Background.png 铺不到两侧，只剩黑边。
+ * 无 dest 的 copy 临时关掉 logical size，让遮罩铺满真窗口。 */
+int egl_shim_SDL_RenderCopy(void *renderer, void *texture,
+                            const void *srcrect, const void *dstrect) {
+  SDL_Renderer *r = (SDL_Renderer *)renderer;
+  const SDL_Rect *src = (const SDL_Rect *)srcrect;
+  const SDL_Rect *dst = (const SDL_Rect *)dstrect;
+  if (!dst && egl_shim_win_w > 0 && egl_shim_screen_w > 0 &&
+      (egl_shim_win_w != egl_shim_screen_w ||
+       egl_shim_win_h != egl_shim_screen_h)) {
+    SDL_RenderSetLogicalSize(r, 0, 0);
+    int ret = SDL_RenderCopy(r, (SDL_Texture *)texture, src, NULL);
+    SDL_RenderSetLogicalSize(r, egl_shim_screen_w, egl_shim_screen_h);
+    return ret;
+  }
+  return SDL_RenderCopy(r, (SDL_Texture *)texture, src, dst);
+}
+
 void egl_shim_map_logical_viewport(int *x, int *y, int *w, int *h) {
   int dw = egl_shim_win_w, dh = egl_shim_win_h;
   int lw = egl_shim_screen_w, lh = egl_shim_screen_h;

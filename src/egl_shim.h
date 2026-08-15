@@ -78,6 +78,8 @@ int egl_shim_SDL_GetDisplayMode(int displayIndex, int modeIndex, void *mode);
 int egl_shim_SDL_GetDisplayBounds(int displayIndex, void *rect);
 void *egl_shim_SDL_CreateRenderer(struct SDL_Window *w, int index, unsigned int flags);
 int egl_shim_SDL_RenderSetLogicalSize(void *renderer, int w, int h);
+int egl_shim_SDL_RenderCopy(void *renderer, void *texture,
+                            const void *srcrect, const void *dstrect);
 int egl_shim_SDL_VideoInit(const char *name);
 int egl_shim_SDL_AudioInit(const char *name);
 void egl_shim_SDL_AudioQuit(void);
