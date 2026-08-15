@@ -633,6 +633,8 @@ int main(int argc, char *argv[]) {
   sw_hook_game_func("_Z12GetInterPathPc",       "GetInterPath");
   sw_hook_game_func("_Z15GetGAMESAVEPathPc",    "GetGAMESAVEPath");
   sw_hook_game_func("_ZN6fileIO15GetResourcePathEPKc", "fileIO_GetResourcePath");
+  /* 开场/过场：原 GetVideoPath 拼 $GAMEDIR/Video/<file>，片源在 assets/Video/。 */
+  sw_hook_game_func("_ZN6fileIO12GetVideoPathEPKc", "fileIO_GetVideoPath");
   /* RoleDataBase / PathDataBase / StoryDataBase：OpenDataFiles() 走 GetACTPath
    * （maps.dat / path.dat / talk1.dat），不是 GetResourcePath。原函数拼
    * $GAMEDIR/<name>，找不到再走 JNI APKX；JNI 全空 → 返回空路径 → fopen("")

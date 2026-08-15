@@ -6,7 +6,7 @@
  * glibc 不 honor WEAK 版本回退导致的 "undefined symbol: free, version LIBC"。
  *
  * 注意：仅在此声明 LIBC 版本节点；未列入任何版本节点的其它全局符号（Android_JNI_*、
- * fopen/open/fread/SDL_RWFromFile/IMG_Load/IMG_LoadPNG_RW/SMPEG_* 等）保持默认（无版本）
+ * fopen/open/fread/SDL_RWFromFile/IMG_Load/IMG_LoadPNG_RW/SMPEG_new_rwops 等）保持默认（无版本）
  * 导出，行为不变。未使用 "local: *;"，故不会误隐藏既有导出。
  */
 LIBC {

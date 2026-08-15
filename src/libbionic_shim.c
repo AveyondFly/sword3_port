@@ -7,11 +7,9 @@
  *              &__sF[1]/&__sF[2]。导出为版本 LIBC 以满足其重定位。
  *   2) Android_JNI_* —— 游戏资源加载经 Android 文件 API（原由 Android 版 libSDL2.so
  *              提供，换设备侧 SDL2 后消失）。这里用 glibc stdio 直接实现。
- *   3) SMPEG_* —— 过场动画 MPEG 解码（Android 版 libsmpeg2.so 依赖 libc++_shared，
- *              而 libc++_shared 把 free/malloc 等标成 LIBC 版本，glibc 无此版本节点，
- *              无法在 glibc 上加载）。游戏本身不依赖 libc++_shared，故这里把 SMPEG_*
- *              做成“安全空操作”桩：SMPEG_status 直接返回 STOPPED，使游戏跳过过场
- *              继续进入菜单/游戏。过场动画暂不播放（已知限制，后续可换真实 libsmpeg2）。
+ *   3) SMPEG_new_rwops —— 过场走随包 libsmpeg2.so（op.bik 实为 MPEG-1）。
+ *              这里只包一层：跳过 nil.bik 一类过小片源，其余转发真 SMPEG。
+ *              其余 SMPEG_* 由 so_resolve 的 dlsym 落到 libsmpeg2，不再做“立刻 STOPPED”桩。
  *
  * 注意：bionic 与 glibc 的 FILE 布局不同。__sF 仅在“按下标取地址后传给 glibc 的
  * fprintf/fwrite”场景下被使用，且 Sword3 这类游戏基本不向 std::cout/cerr 输出，
@@ -1609,6 +1607,7 @@ static const char *sw_find_data_file(const char *name) {
         }
         const char *ins = strstr(name, "/Music/");
         if (!ins) ins = strstr(name, "/Resource/");
+        if (!ins) ins = strstr(name, "/Video/");
         if (!ins) ins = strstr(name, "/zh-Hant/");
         if (!ins) ins = strstr(name, "/zh-Hans/");
         if (ins) {
@@ -1631,6 +1630,8 @@ static const char *sw_find_data_file(const char *name) {
     if (sw_file_exists(buf)) return buf;
     snprintf(buf, sizeof(buf), "%s/assets/Music/%s", base, rel);
     if (sw_file_exists(buf)) return buf;
+    snprintf(buf, sizeof(buf), "%s/assets/Video/%s", base, rel);
+    if (sw_file_exists(buf)) return buf;
     snprintf(buf, sizeof(buf), "%s/assets/zh-Hant/%s", base, rel);
     if (sw_file_exists(buf)) return buf;
     snprintf(buf, sizeof(buf), "%s/assets/zh-Hans/%s", base, rel);
@@ -1638,6 +1639,51 @@ static const char *sw_find_data_file(const char *name) {
     /* 即使不存在也回到 assets/，让后续 fopen 打出真实路径而不是空串 */
     snprintf(buf, sizeof(buf), "%s/assets/%s", base, rel);
     return buf;
+}
+
+/* fileIO::GetVideoPath：原实现拼 GetTargetPath+$GAMEDIR+"/Video/"+小写文件名，
+ * 再 GetAndroidFileIsExists。真机片源在 $GAMEDIR/assets/Video/，原路径找不到就
+ * 返回 NULL，cBinker::bik_Open 直接失败，新游戏开场被跳过（“十六年以后”）。 */
+const char *fileIO_GetVideoPath(void *self, const char *name) {
+    static char buf[4096];
+    char fname[256];
+    const char *rel = name ? name : "";
+    size_t i;
+
+    while (*rel == '/') rel++;
+    if (rel[0] == '.' && rel[1] == '/')
+        rel += 2;
+    for (i = 0; rel[i] && i + 1 < sizeof(fname); i++) {
+        unsigned char c = (unsigned char)rel[i];
+        if (c >= 'A' && c <= 'Z')
+            c = (unsigned char)(c + 32);
+        fname[i] = (char)c;
+    }
+    fname[i] = 0;
+
+    buf[0] = 0;
+    if (name && name[0] == '/' && sw_file_exists(name)) {
+        strncpy(buf, name, sizeof(buf) - 1);
+        buf[sizeof(buf) - 1] = 0;
+    } else if (fname[0]) {
+        const char *found = sw_find_data_file(fname);
+        if (found && sw_file_exists(found)) {
+            strncpy(buf, found, sizeof(buf) - 1);
+            buf[sizeof(buf) - 1] = 0;
+        } else {
+            snprintf(buf, sizeof(buf), "%s/assets/Video/%s", sw_gamedir(), fname);
+        }
+    }
+
+    int ok = sw_file_exists(buf);
+    fprintf(stderr, "[swpath] GetVideoPath '%s' -> '%s'%s\n",
+            name ? name : "", buf, ok ? "" : " (MISSING)");
+    if (self) {
+        strncpy((char *)self, ok ? buf : "", 1023);
+        ((char *)self)[1023] = 0;
+        return ok ? (const char *)self : NULL;
+    }
+    return ok ? buf : NULL;
 }
 
 const char *fileIO_GetACTPath(void *self, const char *name) {
@@ -1703,44 +1749,60 @@ long GetAPKXFileOffsetv(void) {
     return 0L;
 }
 
-/* ---- SMPEG_* 过场动画解码桩（libsmpeg2 在 glibc 上无法加载，这里安全空操作）----
- * 用静态哑 handle 满足“非 NULL”约定；SMPEG_status 返回 STOPPED 让游戏跳过过场。 */
-#define SMPEG_PLAYING 1
-#define SMPEG_STOPPED 0
-#define SMPEG_ERROR   -1
+/* ---- SMPEG_new_rwops：跳过过小片源，其余转发随包 libsmpeg2 ----
+ * 真签名是 (SDL_RWops*, SMPEG_Info*, int freesrc, int sdl_audio)。
+ * 旧桩把 SMPEG_status 做成立刻 STOPPED，开场会被当成播完。 */
+static SMPEG *(*real_SMPEG_new_rwops)(SDL_RWops *, void *, int, int);
+static const char *(*real_SMPEG_error)(SMPEG *);
 
-static int g_smpeg_dummy;  /* 用作非空 handle 的存储 */
+static void shim_resolve_smpeg(void) {
+    void *h;
+    char path[2048];
 
-SMPEG *SMPEG_new_rwops(SDL_RWops *src, SDL_AudioSpec *audio, int sdl_audio) {
-    (void)src; (void)audio; (void)sdl_audio;
-    return (SMPEG *)&g_smpeg_dummy;
+    if (real_SMPEG_new_rwops)
+        return;
+    snprintf(path, sizeof(path), "%s/libsmpeg2.so", sw_gamedir());
+    h = dlopen(path, RTLD_LAZY | RTLD_NOLOAD);
+    if (!h)
+        h = dlopen(path, RTLD_LAZY | RTLD_GLOBAL);
+    if (!h)
+        h = dlopen("libsmpeg2.so", RTLD_LAZY | RTLD_GLOBAL);
+    if (!h) {
+        fprintf(stderr, "[smpeg] dlopen libsmpeg2.so failed: %s\n", dlerror());
+        return;
+    }
+    real_SMPEG_new_rwops =
+        (SMPEG *(*)(SDL_RWops *, void *, int, int))dlsym(h, "SMPEG_new_rwops");
+    real_SMPEG_error = (const char *(*)(SMPEG *))dlsym(h, "SMPEG_error");
+    if (!real_SMPEG_new_rwops)
+        fprintf(stderr, "[smpeg] dlsym SMPEG_new_rwops failed: %s\n", dlerror());
 }
 
-void SMPEG_delete(SMPEG *mpeg) { (void)mpeg; }
+SMPEG *SMPEG_new_rwops(SDL_RWops *src, void *info, int freesrc, int sdl_audio) {
+    Sint64 sz = 0;
 
-void SMPEG_enablevideo(SMPEG *mpeg, int enable) { (void)mpeg; (void)enable; }
-void SMPEG_enableaudio(SMPEG *mpeg, int enable) { (void)mpeg; (void)enable; }
-void SMPEG_setvolume(SMPEG *mpeg, int volume)   { (void)mpeg; (void)volume; }
+    if (src && src->size)
+        sz = src->size(src);
+    /* PSV 同策略：nil.bik 一类空片会卡住解码器 */
+    if (src && sz >= 0 && sz < 100 * 1024) {
+        fprintf(stderr, "[smpeg] skip tiny rwops size=%lld\n", (long long)sz);
+        if (freesrc)
+            SDL_RWclose(src);
+        return NULL;
+    }
 
-void SMPEG_setdisplay(SMPEG *mpeg, SDL_Surface *dst, void *ov,
-                      SDL_Rect *srcrect) {
-    (void)mpeg; (void)dst; (void)ov; (void)srcrect;
-}
+    shim_resolve_smpeg();
+    if (!real_SMPEG_new_rwops) {
+        if (freesrc && src)
+            SDL_RWclose(src);
+        return NULL;
+    }
 
-void SMPEG_play(SMPEG *mpeg)  { (void)mpeg; }
-void SMPEG_pause(SMPEG *mpeg) { (void)mpeg; }
-void SMPEG_stop(SMPEG *mpeg)  { (void)mpeg; }
-
-int SMPEG_status(SMPEG *mpeg) {
-    (void)mpeg;
-    return SMPEG_STOPPED;  /* 立即“播完”，游戏跳过过场继续 */
-}
-
-void SMPEG_actualSpec(SMPEG *mpeg, SDL_AudioSpec *spec) {
-    (void)mpeg;
-    if (spec) memset(spec, 0, sizeof(*spec));
-}
-
-void SMPEG_playAudioSDL(SMPEG *mpeg, SDL_AudioSpec *spec) {
-    (void)mpeg; (void)spec;
+    SMPEG *mpeg = real_SMPEG_new_rwops(src, info, freesrc, sdl_audio);
+    fprintf(stderr, "[smpeg] new_rwops size=%lld mpeg=%p%s%s\n",
+            (long long)sz, (void *)mpeg,
+            (mpeg && real_SMPEG_error && real_SMPEG_error(mpeg)) ? " err=" : "",
+            (mpeg && real_SMPEG_error && real_SMPEG_error(mpeg))
+                ? real_SMPEG_error(mpeg) : "");
+    return mpeg;
 }
