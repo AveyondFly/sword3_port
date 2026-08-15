@@ -177,7 +177,10 @@ static void sw_cpu_performance(void) {
 
 /* A 确认：主指令原样交给游戏；自动/逃跑由 loader 补一层焦点后再走 IsClick。
  * B：战斗只置 BACK_KEY_CLICK；野外/菜单按住=右键按住、松开=右键松开（原始端口）。
- * X 不拦。Start 只留 SELECT+START 退出。 */
+ * X 不拦。Start 只留 SELECT+START 退出。
+ * 系统菜单换人：PSV 开前触摸点头像；游戏自己把 L1/R1 映成 key 25/26，
+ * Console30 / *IconChg 用这两个键切 fcs_Icon。这边无触摸，只把肩键
+ * 写成这两键；方向左右仍交给游戏（道具/法术列表要用来移动）。 */
 #define SW_CMD_BTN_STRIDE 0x60
 #define SW_BTN_ITEM_ID    88
 #define SW_BTN_CLICKED    56
@@ -568,6 +571,45 @@ static int sw_handle_extra_pad(SDL_Event *ev) {
   return 0;
 }
 
+/* 系统子菜单换人：只拦 L1/R1（游戏默认 key 25/26）。方向左右不拦。 */
+static int sw_in_menu_system(void) {
+  int *p = (int *)sw_sym("inMenuSystem");
+  return p && *p;
+}
+
+static void sw_menu_man_key(int key, int down) {
+  void *din = sw_sym("DINPUT");
+  void (*upd)(void *, int, int);
+
+  upd = (void (*)(void *, int, int))sw_sym(
+      "_ZN8SDLINPUT15UpdateKeyStatusEib");
+  if (din && upd)
+    upd(din, key, down);
+}
+
+static int sw_handle_menu_man(SDL_Event *ev) {
+  int down, btn;
+
+  if (!sw_in_menu_system())
+    return 0;
+  if (ev->type != SDL_CONTROLLERBUTTONDOWN &&
+      ev->type != SDL_CONTROLLERBUTTONUP)
+    return 0;
+  down = ev->type == SDL_CONTROLLERBUTTONDOWN;
+  btn = ev->cbutton.button;
+  if (btn == SDL_CONTROLLER_BUTTON_LEFTSHOULDER) {
+    sw_menu_man_key(25, down);
+    ev->cbutton.button = (Uint8)-1;
+    return 1;
+  }
+  if (btn == SDL_CONTROLLER_BUTTON_RIGHTSHOULDER) {
+    sw_menu_man_key(26, down);
+    ev->cbutton.button = (Uint8)-1;
+    return 1;
+  }
+  return 0;
+}
+
 static void sw_push_right_click(int down) {
   SDL_Event e;
   SDL_Window *w;
@@ -608,7 +650,7 @@ int sw_SDL_PollEvent(SDL_Event *ev) {
       ev->cbutton.button = (Uint8)-1;
     } else if (ev->cbutton.button == SDL_CONTROLLER_BUTTON_START) {
       ev->cbutton.button = (Uint8)-1;
-    } else {
+    } else if (!sw_handle_menu_man(ev)) {
       sw_handle_extra_pad(ev);
     }
   }
