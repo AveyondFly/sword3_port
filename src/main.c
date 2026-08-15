@@ -175,15 +175,11 @@ static void sw_cpu_performance(void) {
   }
 }
 
-/* 输入按 PSV 移植 (gitee.com/Moqi01/swd3-e)：
- *   1) hook commButtonClass::draw 画选框，只读 MainMenu_selectitem
- *   2) hook UIGamePad::* → ret0，关掉 Android 虚拟摇杆
- *   3) SDL_PollEvent 把 CONTROLLER 事件原样交给游戏 UpdateJoystick*
- *   PSV 的 B/菜单没有 loader 补丁：B 转成游戏认的 cancel，菜单靠触摸点图标。
- *   2023 so 的 cancel 不走手柄键，TakeKey 读 BACK_KEY_CLICK 再 UndoCommand；
- *   大地图菜单是 mainMouse 点 SS2D+0x380 后 SetVFunctionGroup。
- *   不模拟鼠标、不吃方向、不写 fMenu / MainMenu_selectitem。
- *   这台是 Xbox 布局，A/B 不再按 Vita 的圈/叉对调。 */
+/* 手柄三键分开，互不复用：
+ *   A 确认：原样交给游戏 UpdateJoystick*
+ *   B 返回：只置 BACK_KEY_CLICK（TakeKey → UndoCommand），不兼开菜单
+ *   X 菜单：注入右键。原始端口 B=右键，大地图任意位置右键开系统菜单，不用点图标。
+ * Start 不进菜单，只留 SELECT+START 退出。 */
 #define SW_CMD_BTN_STRIDE 0x60
 #define SW_BTN_ITEM_ID    88
 #define SW_BTN_CLICKED    56
@@ -364,101 +360,96 @@ static void sw_hook_uigamepad(void) {
   }
 }
 
-/* PSV 把 B 转成 cancel。2023 so 的 cancel 是 BACK_KEY_CLICK，TakeKey 见了会 UndoCommand。
- * 只在按下置位，由 TakeKey 自己清；松开时清掉会赶在 TakeKey 前面，返回就丢了。 */
+/* 游戏大地图开关系统菜单都是右键。X 只开、B 只关，避免同一颗键进出。
+ * isShowMenu 在野外 HUD 上常年是 1，不能用来判断是否已在系统菜单里。 */
+static int sw_opened_sysmenu;
+static int sw_saw_game_menu;
+
+static void sw_pad_log(const char *s) {
+  (void)!write(STDERR_FILENO, s, strlen(s));
+}
+
+static int sw_game_in_system_menu(void) {
+  int *in_sys = sw_sym("inMenuSystem");
+  void **fmm = sw_sym("fMouseMain");
+  void *sysmm = sw_sym("_Z12SystemMMousev");
+
+  if (in_sys && *in_sys)
+    return 1;
+  if (fmm && sysmm && *fmm == sysmm)
+    return 1;
+  return 0;
+}
+
+static int sw_in_system_menu(void) {
+  return sw_game_in_system_menu() || sw_opened_sysmenu;
+}
+
+static void sw_push_right_click(int down) {
+  SDL_Event e;
+  SDL_Window *w;
+
+  memset(&e, 0, sizeof(e));
+  e.type = down ? SDL_MOUSEBUTTONDOWN : SDL_MOUSEBUTTONUP;
+  e.button.button = SDL_BUTTON_RIGHT;
+  e.button.state = down ? SDL_PRESSED : SDL_RELEASED;
+  e.button.clicks = 1;
+  e.button.x = 320;
+  e.button.y = 240;
+  w = egl_shim_get_window();
+  if (w)
+    e.button.windowID = SDL_GetWindowID(w);
+  SDL_PushEvent(&e);
+}
+
+static void sw_inject_right_click(void) {
+  static Uint32 last;
+  Uint32 now = SDL_GetTicks();
+  void *in = sw_sym("DINPUT");
+  void (*upd)(void *, int, int);
+
+  if (last && now - last < 400)
+    return;
+  last = now;
+
+  if (in) {
+    ((unsigned char *)in)[1193] = 0x80;
+    upd = (void (*)(void *, int, int))sw_sym(
+        "_ZN8SDLINPUT15UpdateKeyStatusE12SDL_Scancodeb");
+    if (upd)
+      upd(in, 3, 1);
+  }
+  sw_push_right_click(1);
+  sw_push_right_click(0);
+  if (in) {
+    ((unsigned char *)in)[1193] = 0;
+    upd = (void (*)(void *, int, int))sw_sym(
+        "_ZN8SDLINPUT15UpdateKeyStatusE12SDL_Scancodeb");
+    if (upd)
+      upd(in, 3, 0);
+  }
+}
+
+static void sw_open_system_menu(void) {
+  if (sw_in_system_menu())
+    return;
+  sw_pad_log("[pad] X -> open system menu\n");
+  sw_inject_right_click();
+  sw_opened_sysmenu = 1;
+  sw_saw_game_menu = 0;
+}
+
+/* B：战斗走 BACK_KEY_CLICK；系统菜单里再补一次右键，对应游戏自己的退出。 */
 static void sw_psv_cancel(void) {
   unsigned char *bk = sw_sym("BACK_KEY_CLICK");
   if (bk)
     *bk = 1;
-}
-
-/* 大地图在 ShellLoop→PlayConsole，不走 mainMouse。
- * SetVFunctionGroup 没有 System 组（0 是空操作）。PSV 点图标后游戏会把
- * fMouseMain/fExecute/… 换成 System* 并 SystemConstruct。Start 只置位，
- * 由 PlayConsole（野外）或 mainMouse（其它界面）在游戏线程里完成切换。 */
-static int sw_want_sysmenu;
-static void (*mainMouse_orig)(void);
-static void (*PlayConsole_orig)(void *);
-
-static void sw_install_fn(const char *slot, const char *fn) {
-  void **p = sw_sym(slot);
-  void *f = sw_sym(fn);
-  if (p && f)
-    *p = f;
-}
-
-static void sw_open_system_menu(void) {
-  unsigned char *show = sw_sym("isShowMenu");
-  int *in_sys = sw_sym("inMenuSystem");
-  void (*construct)(void);
-
-  if (show && *show)
-    return;
-  if (in_sys && *in_sys)
-    return;
-
-  sw_install_fn("fMouseMain", "_Z12SystemMMousev");
-  sw_install_fn("fMouseSub", "_Z12nullFunctionv");
-  sw_install_fn("fArrowDown", "_Z15SystemArrowDownv");
-  sw_install_fn("fArrowUp", "_Z13SystemArrowUpv");
-  sw_install_fn("fArrowLeft", "_Z15SystemArrowLeftv");
-  sw_install_fn("fArrowRight", "_Z16SystemArrowRightv");
-  sw_install_fn("fPageDown", "_Z14SystemPageDownv");
-  sw_install_fn("fPageUp", "_Z12SystemPageUpv");
-  sw_install_fn("fShiftTab", "_Z13SystemIconChgv");
-  sw_install_fn("fEnd", "_Z9SystemEndv");
-  sw_install_fn("fExecute", "_Z13SystemExecutev");
-  sw_install_fn("fCancel", "_Z11SystemAbortv");
-  sw_install_fn("fRenderWorkSpace", "_Z12SystemRenderv");
-
-  construct = (void (*)(void))sw_sym("_Z15SystemConstructv");
-  if (construct)
-    construct();
-  debugPrintf("[pad] Start -> SystemConstruct inMenuSystem=%d\n",
-              in_sys ? *in_sys : -1);
-}
-
-static void sw_try_open_system_menu(void) {
-  if (!sw_want_sysmenu)
-    return;
-  sw_want_sysmenu = 0;
-  sw_open_system_menu();
-}
-
-static void j_mainMouse(void) {
-  sw_try_open_system_menu();
-  mainMouse_orig();
-}
-
-static void j_PlayConsole(void *ev) {
-  sw_try_open_system_menu();
-  PlayConsole_orig(ev);
-}
-
-static void sw_hook_fn(const char *sym, void **orig, uintptr_t hook, const char *tag) {
-  uintptr_t a = so_find_addr_safe(sym);
-  if (!a) {
-    debugPrintf("[patch] %s not found\n", tag);
-    return;
+  if (sw_in_system_menu()) {
+    sw_pad_log("[pad] B -> close system menu\n");
+    sw_inject_right_click();
+    sw_opened_sysmenu = 0;
+    sw_saw_game_menu = 0;
   }
-  *orig = sw_make_draw_tramp(a);
-  if (!*orig) {
-    debugPrintf("[patch] %s tramp mmap failed\n", tag);
-    return;
-  }
-  hook_arm64(a, hook);
-  debugPrintf("[patch] %s -> Start=System*\n", tag);
-}
-
-static void sw_hook_sysmenu(void) {
-  sw_hook_fn("_Z9mainMousev", (void **)&mainMouse_orig,
-             (uintptr_t)j_mainMouse, "mainMouse");
-  sw_hook_fn("_Z11PlayConsoleP9SDL_Event", (void **)&PlayConsole_orig,
-             (uintptr_t)j_PlayConsole, "PlayConsole");
-}
-
-static void sw_psv_system_menu(void) {
-  sw_want_sysmenu = 1;
 }
 
 int sw_SDL_PollEvent(SDL_Event *ev) {
@@ -466,16 +457,15 @@ int sw_SDL_PollEvent(SDL_Event *ev) {
   if (r > 0 &&
       (ev->type == SDL_CONTROLLERBUTTONDOWN ||
        ev->type == SDL_CONTROLLERBUTTONUP)) {
-    /* PSV：Start 屏蔽；B 转成游戏认的 cancel。2023 so 的 B 会走 key22，不是返回。 */
     if (ev->cbutton.button == SDL_CONTROLLER_BUTTON_B) {
       if (ev->type == SDL_CONTROLLERBUTTONDOWN)
         sw_psv_cancel();
       ev->cbutton.button = (Uint8)-1;
+    } else if (ev->cbutton.button == SDL_CONTROLLER_BUTTON_X) {
+      if (ev->type == SDL_CONTROLLERBUTTONDOWN)
+        sw_open_system_menu();
+      ev->cbutton.button = (Uint8)-1;
     } else if (ev->cbutton.button == SDL_CONTROLLER_BUTTON_START) {
-      if (ev->type == SDL_CONTROLLERBUTTONDOWN) {
-        debugPrintf("[pad] Start down (PollEvent)\n");
-        sw_psv_system_menu();
-      }
       ev->cbutton.button = (Uint8)-1;
     }
   }
@@ -486,6 +476,7 @@ int sw_SDL_PollEvent(SDL_Event *ev) {
 static void *sw_input_thread(void *arg) {
   (void)arg;
   SDL_GameController *pad = NULL;
+  int prev_x = 0, prev_b = 0;
   for (;;) {
     SDL_GameControllerUpdate();
     if (!pad) {
@@ -494,7 +485,8 @@ static void *sw_input_thread(void *arg) {
         if (SDL_IsGameController(i)) {
           pad = SDL_GameControllerOpen(i);
           if (pad) {
-            debugPrintf("[input] pad opened (idx=%d) native joystick path\n", i);
+            debugPrintf("[input] pad opened (idx=%d) %s\n", i,
+                        SDL_GameControllerName(pad));
             break;
           }
         }
@@ -503,15 +495,25 @@ static void *sw_input_thread(void *arg) {
     if (pad) {
       int start = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_START);
       int back = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_BACK);
-      static int prev_start;
+      int x = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_X);
+      int b = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_B);
       if (start && back) {
         static const char msg[] = "[pad] SELECT+START -> exit\n";
         (void)!write(STDERR_FILENO, msg, sizeof(msg) - 1);
         _exit(0);
       }
-      if (start && !prev_start && !back)
-        sw_psv_system_menu();
-      prev_start = start;
+      if (x && !prev_x)
+        sw_open_system_menu();
+      if (b && !prev_b)
+        sw_psv_cancel();
+      prev_x = x;
+      prev_b = b;
+      if (sw_opened_sysmenu && sw_game_in_system_menu())
+        sw_saw_game_menu = 1;
+      if (sw_opened_sysmenu && sw_saw_game_menu && !sw_game_in_system_menu()) {
+        sw_opened_sysmenu = 0;
+        sw_saw_game_menu = 0;
+      }
     }
     SDL_Delay(16);
   }
@@ -650,7 +652,7 @@ int main(int argc, char *argv[]) {
   sw_cpu_performance();
   debugPrintf("=== 仙剑奇侠传三 (Sword3) ARM64 so-loader (NextOS) ===\n");
   /* 启动横幅加策略标识：随包 SDL2_image + 部署期 LIBC->WEAK（便于现场日志核对）。 */
-  debugPrintf("[build] %s %s (PSV: B=BACK_KEY_CLICK Start=System*)\n",
+  debugPrintf("[build] %s %s (A=confirm B=back/close X=open)\n",
               __DATE__, __TIME__);
 
   /* 1) 设备侧 SDL2 初始化窗口：egl_shim 自动选后端（fbdev/kmsdrm/wayland），
@@ -723,7 +725,6 @@ int main(int argc, char *argv[]) {
   sw_hook_game_func("_Z17GetAPKXFileOffsetv", "GetAPKXFileOffsetv");
   sw_hook_commbutton_draw();
   sw_hook_uigamepad();
-  sw_hook_sysmenu();
 
   /* 2023 SDL_SS2D::Init 结尾用 tpidr+0x28 做 canary。glibc 上该槽会被 Mali/PNG
    * 改掉 → 误走 "Couldn't create window" 并和第二次 canary 检查死循环刷屏。
