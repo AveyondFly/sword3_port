@@ -175,15 +175,25 @@ static void sw_cpu_performance(void) {
   }
 }
 
-/* A 确认：原样交给游戏。
+/* A 确认：主指令原样交给游戏；自动/逃跑由 loader 补一层焦点后再走 IsClick。
  * B：战斗只置 BACK_KEY_CLICK；野外/菜单按住=右键按住、松开=右键松开（原始端口）。
  * X 不拦。Start 只留 SELECT+START 退出。 */
 #define SW_CMD_BTN_STRIDE 0x60
 #define SW_BTN_ITEM_ID    88
 #define SW_BTN_CLICKED    56
+#define SW_BTN_DISABLED   44
+#define SW_BTN_CLICKABLE  58
 #define SW_N_MAIN_CMD     7
 #define SW_N_EX_CMD       4
 #define SW_N_OBS_CMD      2
+#define SW_EXTRA_NONE     0
+#define SW_EXTRA_RETREAT  1
+#define SW_EXTRA_AUTO     2
+
+static int g_extra_sel;
+static int g_extra_click;
+static int g_extra_saved_sel = 1;
+static int sw_in_fight(void);
 
 static void *sw_sym(const char *name) {
   return (void *)so_find_addr_safe(name);
@@ -201,9 +211,25 @@ static char *sw_cmd_buttons(void) {
   return p;
 }
 
+static char *sw_retreat_btn(void) {
+  static char *p;
+  if (!p) p = (char *)sw_sym("RetreatButton");
+  return p;
+}
+
+static char *sw_auto_btn(void) {
+  static char *p;
+  if (!p) p = (char *)sw_sym("AutoButton");
+  return p;
+}
+
 static int sw_ptr_in_range(const void *p, const char *base, int n) {
   return base && (const char *)p >= base &&
          (const char *)p < base + n * SW_CMD_BTN_STRIDE;
+}
+
+static int sw_is_extra_button(const void *btn) {
+  return btn && (btn == sw_retreat_btn() || btn == sw_auto_btn());
 }
 
 static int sw_is_newui_button(const void *btn) {
@@ -213,10 +239,23 @@ static int sw_is_newui_button(const void *btn) {
     return 1;
   if (sw_ptr_in_range(btn, sw_sym("ObsoltCommandButton"), SW_N_OBS_CMD))
     return 1;
+  if (sw_is_extra_button(btn))
+    return 1;
   return 0;
 }
 
+static int sw_btn_enabled(const char *btn) {
+  return btn && btn[SW_BTN_CLICKABLE] && !btn[SW_BTN_DISABLED];
+}
+
 static int sw_btn_is_selected(const void *btn) {
+  if (g_extra_sel) {
+    if (btn == sw_retreat_btn())
+      return g_extra_sel == SW_EXTRA_RETREAT;
+    if (btn == sw_auto_btn())
+      return g_extra_sel == SW_EXTRA_AUTO;
+    return 0;
+  }
   unsigned char *force_obs = sw_sym("ForceObsoltMenu");
   int *obs_sel = sw_sym("ObsoltSel");
   char *obs = sw_sym("ObsoltCommandButton");
@@ -274,10 +313,19 @@ static void sw_blit_select_frame(void *btn, int x, int y) {
 static int (*commButton_draw_orig)(void *this, int x, int y);
 static int (*commButton_drawText_orig)(void *this, int a2, int a3,
                                        const char *a4, void *color);
+static int (*commButton_isclick_orig)(void *this);
 
 static int j_commButton_draw(void *this, int x, int y) {
   char *btn = this;
   int newui = sw_is_newui_button(this);
+  if (g_extra_sel && !sw_in_fight()) {
+    g_extra_sel = SW_EXTRA_NONE;
+    g_extra_click = 0;
+  } else if (g_extra_sel) {
+    int *sel = sw_menu_select();
+    if (sel && *sel)
+      *sel = 0;
+  }
   unsigned char saved = 0;
   if (newui && btn) {
     saved = (unsigned char)btn[SW_BTN_CLICKED];
@@ -298,6 +346,16 @@ static int j_commButton_drawText(void *this, int a2, int a3, const char *a4,
   if (sw_is_newui_button(this))
     return commButton_drawText_orig(this, a2, a3, a4, NULL);
   return commButton_drawText_orig(this, a2, a3, a4, color);
+}
+
+/* TakeKey 里自动/逃跑只认 IsClick（鼠标落在按钮上）。方向键选中后由这里补一次命中。 */
+static int j_commButton_isclick(void *this) {
+  if (g_extra_click && sw_is_extra_button(this) && sw_btn_is_selected(this)) {
+    g_extra_click = 0;
+    g_extra_sel = SW_EXTRA_NONE;
+    return 1;
+  }
+  return commButton_isclick_orig(this);
 }
 
 static void *sw_make_draw_tramp(uintptr_t func) {
@@ -336,6 +394,16 @@ static void sw_hook_commbutton_draw(void) {
       debugPrintf("[patch] commButtonClass::drawButtonText -> no clicked color\n");
     }
   }
+  {
+    uintptr_t click = so_find_addr_safe("_ZN15commButtonClass7IsClickEv");
+    if (click) {
+      commButton_isclick_orig = sw_make_draw_tramp(click);
+      if (commButton_isclick_orig) {
+        hook_arm64(click, (uintptr_t)j_commButton_isclick);
+        debugPrintf("[patch] commButtonClass::IsClick -> extra-row confirm\n");
+      }
+    }
+  }
 }
 
 static void sw_hook_uigamepad(void) {
@@ -364,6 +432,142 @@ static int sw_in_fight(void) {
   return f && *f;
 }
 
+static int sw_force_submenu(void) {
+  unsigned char *a = sw_sym("ForceSpellMenu");
+  unsigned char *b = sw_sym("ForceCommandMenu");
+  unsigned char *c = sw_sym("ForceObsoltMenu");
+  unsigned char *d = sw_sym("ForceChAttrMenu");
+  return (a && *a == 1) || (b && *b == 1) || (c && *c == 1) || (d && *d == 1);
+}
+
+static int sw_btn_item_id(const char *btn) {
+  return btn ? *(int *)(btn + SW_BTN_ITEM_ID) : 0;
+}
+
+static int sw_scan_has_item(const char *base, int n, int id) {
+  int i;
+  if (!base || id <= 0)
+    return 0;
+  for (i = 0; i < n; i++) {
+    const char *b = base + i * SW_CMD_BTN_STRIDE;
+    if (sw_btn_enabled(b) && sw_btn_item_id(b) == id)
+      return 1;
+  }
+  return 0;
+}
+
+static int sw_cmd_has_item(int id) {
+  return sw_scan_has_item(sw_cmd_buttons(), SW_N_MAIN_CMD, id) ||
+         sw_scan_has_item(sw_sym("ExCommandButton"), SW_N_EX_CMD, id);
+}
+
+static int sw_extra_row_visible(void) {
+  char *a = sw_auto_btn();
+  char *r = sw_retreat_btn();
+  /* +44=disable_draw；有 surface 说明 FightMenu 已 init、这一帧会画。 */
+  return (a && !a[SW_BTN_DISABLED] && *(void **)a) ||
+         (r && !r[SW_BTN_DISABLED] && *(void **)r);
+}
+
+/* 主指令条可见、且底下自动/逃跑也画出来了。炼妖/符鬼子菜单时这两颗不画。 */
+static int sw_cmd_extra_active(void) {
+  return sw_in_fight() && !sw_force_submenu() && sw_extra_row_visible();
+}
+
+static int sw_on_last_cmd_col(void) {
+  int *sel = sw_menu_select();
+  int id = (sel && *sel > 0) ? *sel : 1;
+  return !sw_cmd_has_item(id + 3);
+}
+
+static int sw_extra_ok(const char *btn) {
+  return btn && !btn[SW_BTN_DISABLED] && *(void **)btn;
+}
+
+static void sw_enter_extra(void) {
+  int *sel = sw_menu_select();
+  int id = (sel && *sel > 0) ? *sel : 1;
+  int col = (id - 1) % 3;
+  g_extra_saved_sel = id;
+  g_extra_sel = (col >= 2) ? SW_EXTRA_RETREAT : SW_EXTRA_AUTO;
+  if (g_extra_sel == SW_EXTRA_AUTO && !sw_extra_ok(sw_auto_btn()))
+    g_extra_sel = SW_EXTRA_RETREAT;
+  if (g_extra_sel == SW_EXTRA_RETREAT && !sw_extra_ok(sw_retreat_btn()))
+    g_extra_sel = SW_EXTRA_AUTO;
+  if (sel)
+    *sel = 0;
+}
+
+static void sw_leave_extra(void) {
+  int *sel = sw_menu_select();
+  if (sel && g_extra_saved_sel > 0)
+    *sel = g_extra_saved_sel;
+  g_extra_sel = SW_EXTRA_NONE;
+  g_extra_click = 0;
+}
+
+static int sw_handle_extra_pad(SDL_Event *ev) {
+  int down, btn;
+
+  if (!sw_cmd_extra_active()) {
+    if (g_extra_sel)
+      sw_leave_extra();
+    return 0;
+  }
+  if (ev->type != SDL_CONTROLLERBUTTONDOWN &&
+      ev->type != SDL_CONTROLLERBUTTONUP)
+    return 0;
+
+  down = ev->type == SDL_CONTROLLERBUTTONDOWN;
+  btn = ev->cbutton.button;
+
+  if (btn == SDL_CONTROLLER_BUTTON_DPAD_DOWN) {
+    if (down && !g_extra_sel && sw_on_last_cmd_col()) {
+      sw_enter_extra();
+      ev->cbutton.button = (Uint8)-1;
+      return 1;
+    }
+    if (g_extra_sel) {
+      ev->cbutton.button = (Uint8)-1;
+      return 1;
+    }
+    return 0;
+  }
+  if (btn == SDL_CONTROLLER_BUTTON_DPAD_UP) {
+    if (g_extra_sel) {
+      if (down)
+        sw_leave_extra();
+      ev->cbutton.button = (Uint8)-1;
+      return 1;
+    }
+    return 0;
+  }
+  if (btn == SDL_CONTROLLER_BUTTON_DPAD_LEFT ||
+      btn == SDL_CONTROLLER_BUTTON_DPAD_RIGHT) {
+    if (!g_extra_sel)
+      return 0;
+    if (down) {
+      if (btn == SDL_CONTROLLER_BUTTON_DPAD_LEFT)
+        g_extra_sel = sw_extra_ok(sw_auto_btn()) ? SW_EXTRA_AUTO
+                                                : SW_EXTRA_RETREAT;
+      else
+        g_extra_sel = sw_extra_ok(sw_retreat_btn()) ? SW_EXTRA_RETREAT
+                                                   : SW_EXTRA_AUTO;
+    }
+    ev->cbutton.button = (Uint8)-1;
+    return 1;
+  }
+  if (btn == SDL_CONTROLLER_BUTTON_A) {
+    if (!g_extra_sel)
+      return 0;
+    if (down)
+      g_extra_click = 1;
+    ev->cbutton.button = (Uint8)-1;
+    return 1;
+  }
+  return 0;
+}
+
 static void sw_push_right_click(int down) {
   SDL_Event e;
   SDL_Window *w;
@@ -388,7 +592,10 @@ int sw_SDL_PollEvent(SDL_Event *ev) {
        ev->type == SDL_CONTROLLERBUTTONUP)) {
     if (ev->cbutton.button == SDL_CONTROLLER_BUTTON_B) {
       int down = ev->type == SDL_CONTROLLERBUTTONDOWN;
-      if (sw_in_fight()) {
+      if (sw_in_fight() && g_extra_sel) {
+        if (down)
+          sw_leave_extra();
+      } else if (sw_in_fight()) {
         if (down) {
           unsigned char *bk = sw_sym("BACK_KEY_CLICK");
           if (bk)
@@ -401,6 +608,8 @@ int sw_SDL_PollEvent(SDL_Event *ev) {
       ev->cbutton.button = (Uint8)-1;
     } else if (ev->cbutton.button == SDL_CONTROLLER_BUTTON_START) {
       ev->cbutton.button = (Uint8)-1;
+    } else {
+      sw_handle_extra_pad(ev);
     }
   }
   egl_shim_tls_restore();
