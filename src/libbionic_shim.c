@@ -32,7 +32,15 @@
 #include <dlfcn.h>
 #include <iconv.h>
 #include <stdint.h>
+#include <png.h>
 #include <ucontext.h>   /* ucontext_t / mcontext_t / REG_* (aarch64 glibc) */
+
+static const char *sw_gamedir(void);
+static int sw_file_exists(const char *path);
+static const char *sw_find_data_file(const char *name);
+static void shim_note_audio_path(const char *path);
+static char g_apkx_current[4096];
+SDL_Surface *IMG_LoadPNG_RW(SDL_RWops *src, int freesrc);
 
 /* 资源路径过滤：仅对“资源相关”路径打印诊断，避免刷屏。 */
 static int shim_filt(const char *p) {
@@ -76,8 +84,8 @@ static int shim_want_log(const char *p) {
 }
 
 /* 登记游戏打开的 png FILE*，供 fread 诊断使用（仅小集合，环形覆盖） */
-#define PNG_FP_MAX 64
-static FILE *g_png_fp[PNG_FP_MAX];
+#define SHIM_PNG_FP_MAX 64
+static FILE *g_png_fp[SHIM_PNG_FP_MAX];
 static int g_png_fp_n = 0;
 static char g_last_png_path[4096];   /* fopen/open 拦截器记录的最近一次 png 路径，供 IMG_LoadPNG_RW 回退重开 */
 static char g_last_ttf_path[4096];   /* fopen/open 拦截器记录的最近一次 ttf 路径，供 TTF_OpenFontRW 回退重开 */
@@ -179,6 +187,37 @@ static void shim_report_empty(const char *api) {
     shim_fpwalk(__builtin_frame_address(0));
 }
 
+static const char *shim_resolve_open_path(const char *path) {
+    if (!path || !*path) {
+        if (g_apkx_current[0] && sw_file_exists(g_apkx_current))
+            return g_apkx_current;
+        const char *db = sw_find_data_file("StringDB.txt");
+        if (db && sw_file_exists(db))
+            return db;
+        return path;
+    }
+    /* 绝对路径也要 remap：游戏 fCreateFile("/tmp/s3/Music/1a-04.mp3")，
+     * 文件实际在 assets/Music/。原先绝对路径原样返回 → 存在性检查过了、打开失败。 */
+    if (path[0] == '/' && sw_file_exists(path))
+        return path;
+    const char *found = sw_find_data_file(path);
+    if (found && sw_file_exists(found))
+        return found;
+    /* 资源包缺 FBack/BackIconClick，用已有 BackIcon 顶上，否则战斗只有确认没有返回。 */
+    {
+        const char *base = strrchr(path, '/');
+        base = base ? base + 1 : path;
+        if (!strcmp(base, "BackIconClick.png") ||
+            !strcmp(base, "FBackIcon.png") ||
+            !strcmp(base, "FBackIconClick.png")) {
+            found = sw_find_data_file("BackIcon.png");
+            if (found && sw_file_exists(found))
+                return found;
+        }
+    }
+    return path;
+}
+
 static FILE *(*real_fopen)(const char *, const char *) = NULL;
 FILE *fopen(const char *path, const char *mode) {
     if (!real_fopen) {
@@ -187,6 +226,11 @@ FILE *fopen(const char *path, const char *mode) {
             fprintf(stderr, "[shim] real_fopen NULL dlerr=%s\n",
                     dlerror() ? dlerror() : "?");
     }
+    const char *resolved = shim_resolve_open_path(path);
+    if (resolved && path && resolved != path && strcmp(resolved, path) != 0)
+        fprintf(stderr, "[shim:fopen] remap '%s' -> '%s'\n", path, resolved);
+    path = resolved;
+    shim_note_audio_path(path);
     FILE *f = real_fopen ? real_fopen(path, mode) : NULL;
     if (f && strstr(path, ".ttf")) {  /* 直接 fopen 字体的备用路径也推断编码 */
         const char *base = strrchr(path, '/');
@@ -198,7 +242,7 @@ FILE *fopen(const char *path, const char *mode) {
     }
     int is_png = shim_is_png(path);
     if (is_png && f) {
-        if (g_png_fp_n < PNG_FP_MAX) g_png_fp[g_png_fp_n++] = f;
+        if (g_png_fp_n < SHIM_PNG_FP_MAX) g_png_fp[g_png_fp_n++] = f;
         if (path) {
             strncpy(g_last_png_path, path, sizeof(g_last_png_path) - 1);
             g_last_png_path[sizeof(g_last_png_path) - 1] = '\0';
@@ -230,6 +274,14 @@ int open(const char *path, int flags, ...) {
                     dlerror() ? dlerror() : "?");
     }
     if (!real_open) return -1;
+    {
+        const char *resolved = shim_resolve_open_path(path);
+        if (resolved && path && resolved != path && strcmp(resolved, path) != 0 &&
+            (!(flags & O_CREAT) || sw_file_exists(resolved))) {
+            fprintf(stderr, "[shim:open] remap '%s' -> '%s'\n", path, resolved);
+            path = resolved;
+        }
+    }
     va_list ap; va_start(ap, flags);
     mode_t mode = (flags & O_CREAT) ? va_arg(ap, mode_t) : 0;
     va_end(ap);
@@ -268,6 +320,14 @@ int open64(const char *path, int flags, ...) {
         if (!real_open64 && real_open) real_open64 = real_open;
     }
     if (!real_open64) return -1;
+    {
+        const char *resolved = shim_resolve_open_path(path);
+        if (resolved && path && resolved != path && strcmp(resolved, path) != 0 &&
+            (!(flags & O_CREAT) || sw_file_exists(resolved))) {
+            fprintf(stderr, "[shim:open64] remap '%s' -> '%s'\n", path, resolved);
+            path = resolved;
+        }
+    }
     va_list ap; va_start(ap, flags);
     mode_t mode = (flags & O_CREAT) ? va_arg(ap, mode_t) : 0;
     va_end(ap);
@@ -300,10 +360,12 @@ static FILE *(*real_fopen64)(const char *, const char *) = NULL;
 FILE *fopen64(const char *path, const char *mode) {
     if (!real_fopen64)
         real_fopen64 = (FILE *(*)(const char *, const char *))dlsym(RTLD_NEXT, "fopen64");
+    path = shim_resolve_open_path(path);
+    shim_note_audio_path(path);
     FILE *f = real_fopen64 ? real_fopen64(path, mode) : NULL;
     int is_png = shim_is_png(path);
     if (is_png && f) {
-        if (g_png_fp_n < PNG_FP_MAX) g_png_fp[g_png_fp_n++] = f;
+        if (g_png_fp_n < SHIM_PNG_FP_MAX) g_png_fp[g_png_fp_n++] = f;
         if (path) {
             strncpy(g_last_png_path, path, sizeof(g_last_png_path) - 1);
             g_last_png_path[sizeof(g_last_png_path) - 1] = '\0';
@@ -428,6 +490,12 @@ size_t fread(void *ptr, size_t size, size_t nmemb, FILE *stream) {
 static SDL_RWops *(*real_SDL_RWFromFP)(FILE *, SDL_bool) = NULL;
 SDL_RWops *SDL_RWFromFile(const char *file, const char *mode) {
     if (!file) return NULL;
+    if (!real_fopen)
+        real_fopen = (FILE *(*)(const char *, const char *))dlsym(RTLD_NEXT, "fopen");
+    const char *resolved = shim_resolve_open_path(file);
+    if (resolved && file && resolved != file && strcmp(resolved, file) != 0)
+        fprintf(stderr, "[shim:RW] remap '%s' -> '%s'\n", file, resolved);
+    file = resolved;
     FILE *f = real_fopen ? real_fopen(file, mode ? mode : "rb") : NULL;
     if (!f) {
         fprintf(stderr, "[shim:RW] fopen FAIL '%s'\n", file);
@@ -491,32 +559,152 @@ SDL_Surface *IMG_Load(const char *file) {
  * 全局查找域，RTLD_NEXT 不可见），则显式 dlopen("libSDL2_image.so")（LD_LIBRARY_PATH 含
  * $GAMEDIR，必能命中随包/系统那份，两者都导出 IMG_LoadPNG_RW）取其真解码器句柄。 */
 static SDL_Surface *(*real_IMG_LoadPNG_RW)(SDL_RWops *, int) = NULL;
+static SDL_Surface *(*real_IMG_LoadTyped_RW)(SDL_RWops *, int, const char *) = NULL;
 static int g_decoder_ready = 0;
+static int g_png_ok_n, g_png_fail_n;
+
+/* 本进程里 sword3 与 libbionic_shim.so 各有一份 IMG_LoadPNG_RW。
+ * dlsym(RTLD_NEXT) 会命中另一份 shim 而不是真正的解码器，必须跳过自身地址。 */
+static void *png_dlsym_leaf(void *h, const char *sym) {
+    if (!h) return NULL;
+    void *p = dlsym(h, sym);
+    if (!p || p == (void *)IMG_LoadPNG_RW) return NULL;
+    return p;
+}
+
+static void *png_try_open(const char *path) {
+    void *h = dlopen(path, RTLD_LAZY | RTLD_NOLOAD);
+    if (!h) h = dlopen(path, RTLD_LAZY);
+    return h;
+}
+
+static SDL_Surface *shim_png_from_mem(const unsigned char *data, size_t len) {
+    if (!data || len < 8 || png_sig_cmp((png_const_bytep)data, 0, 8) != 0)
+        return NULL;
+    png_image img;
+    memset(&img, 0, sizeof(img));
+    img.version = PNG_IMAGE_VERSION;
+    if (!png_image_begin_read_from_memory(&img, data, len))
+        return NULL;
+    img.format = PNG_FORMAT_RGBA;
+    SDL_Surface *s = SDL_CreateRGBSurfaceWithFormat(
+        0, (int)img.width, (int)img.height, 32, SDL_PIXELFORMAT_RGBA32);
+    if (!s) {
+        png_image_free(&img);
+        return NULL;
+    }
+    if (!png_image_finish_read(&img, NULL, s->pixels, 0, NULL)) {
+        SDL_FreeSurface(s);
+        png_image_free(&img);
+        return NULL;
+    }
+    png_image_free(&img);
+    return s;
+}
+
+static int g_png_reenter;
+static SDL_Surface *shim_png_decode_buf(const unsigned char *data, size_t len) {
+    if (!data || !len) return NULL;
+    if (g_png_reenter)
+        return shim_png_from_mem(data, len);
+    SDL_Surface *s = NULL;
+    g_png_reenter = 1;
+    if (real_IMG_LoadPNG_RW) {
+        SDL_RWops *mem = SDL_RWFromMem((void *)data, (int)len);
+        if (mem) s = real_IMG_LoadPNG_RW(mem, 1);
+    }
+    if (!s && real_IMG_LoadTyped_RW) {
+        SDL_RWops *mem = SDL_RWFromMem((void *)data, (int)len);
+        if (mem) s = real_IMG_LoadTyped_RW(mem, 1, "PNG");
+    }
+    g_png_reenter = 0;
+    if (!s)
+        s = shim_png_from_mem(data, len);
+    return s;
+}
+
 static void shim_resolve_png_decoder(void) {
     if (g_decoder_ready) return;
     g_decoder_ready = 1;
-    real_IMG_LoadPNG_RW =
-        (SDL_Surface *(*)(SDL_RWops *, int))dlsym(RTLD_NEXT, "IMG_LoadPNG_RW");
-    if (!real_IMG_LoadPNG_RW) {
-        void *h = dlopen("libSDL2_image.so", RTLD_LAZY | RTLD_GLOBAL);
-        if (h)
+    const char *cands[] = {
+        "/usr/lib/libSDL2_image-2.0.so.0",
+        "libSDL2_image-2.0.so.0",
+        "libSDL2_image.so.android",
+        "libSDL2_image.so",
+        NULL
+    };
+    for (int i = 0; cands[i]; i++) {
+        void *h = png_try_open(cands[i]);
+        if (!h) continue;
+        if (!real_IMG_LoadPNG_RW)
             real_IMG_LoadPNG_RW =
-                (SDL_Surface *(*)(SDL_RWops *, int))dlsym(h, "IMG_LoadPNG_RW");
+                (SDL_Surface *(*)(SDL_RWops *, int))png_dlsym_leaf(h, "IMG_LoadPNG_RW");
+        if (!real_IMG_LoadTyped_RW)
+            real_IMG_LoadTyped_RW =
+                (SDL_Surface *(*)(SDL_RWops *, int, const char *))png_dlsym_leaf(h, "IMG_LoadTyped_RW");
+        if (real_IMG_LoadPNG_RW || real_IMG_LoadTyped_RW)
+            break;
     }
-    fprintf(stderr, "[shim:PNG_RW] decoder resolved=%s\n",
-            real_IMG_LoadPNG_RW ? "yes" : "NO");
+    fprintf(stderr, "[shim:PNG_RW] decoder png=%s typed=%s libpng=yes\n",
+            real_IMG_LoadPNG_RW ? "yes" : "NO",
+            real_IMG_LoadTyped_RW ? "yes" : "NO");
 }
+static SDL_Surface *shim_png_from_path(const char *path) {
+    if (!path || !path[0])
+        return NULL;
+    if (!real_fopen)
+        real_fopen = (FILE *(*)(const char *, const char *))dlsym(RTLD_NEXT, "fopen");
+    if (!real_fopen)
+        return NULL;
+    FILE *ff = real_fopen(path, "rb");
+    if (!ff)
+        return NULL;
+    if (fseek(ff, 0, SEEK_END) != 0) {
+        fclose(ff);
+        return NULL;
+    }
+    long sz = ftell(ff);
+    if (sz <= 0) {
+        fclose(ff);
+        return NULL;
+    }
+    if (fseek(ff, 0, SEEK_SET) != 0) {
+        fclose(ff);
+        return NULL;
+    }
+    unsigned char *b = (unsigned char *)malloc((size_t)sz);
+    if (!b) {
+        fclose(ff);
+        return NULL;
+    }
+    size_t got = fread(b, 1, (size_t)sz, ff);
+    fclose(ff);
+    SDL_Surface *s = (got == (size_t)sz) ? shim_png_decode_buf(b, got) : NULL;
+    free(b);
+    return s;
+}
+
 SDL_Surface *IMG_LoadPNG_RW(SDL_RWops *src, int freesrc) {
     shim_resolve_png_decoder();
     if (!src) return NULL;
-    fprintf(stderr, "[shim:PNG_RW] enter (type=%d)\n", (int)src->type);
+
+    /* 游戏 RWops 的 read 在短读（最后一块 < 64KB）时返回 0，dpad 等 >64KB 的图
+     * 会被截成正好 65536 字节。优先按 fopen 记下的路径整读。内存 RWops 除外。 */
+    if (g_last_png_path[0] && src->type != 4 && src->type != 5) {
+        SDL_Surface *from_file = shim_png_from_path(g_last_png_path);
+        if (from_file) {
+            g_png_ok_n++;
+            if (g_png_ok_n + g_png_fail_n <= 3)
+                fprintf(stderr, "[shim:PNG_RW] file '%s' OK\n", g_last_png_path);
+            return from_file;
+        }
+    }
 
     /* Bug2 修复（稳健版）：游戏在调用 IMG_LoadPNG_RW 前已把 RWops 读空停在 EOF，
      * 且该 RWops 的 seek 回调在 glibc 上失效（SDL_RWseek 返回 -1）。单纯 seek 复位
      * 无效。策略：先尽力 seek+slurp；若 slurp 得不到数据，则用 fopen/open 拦截器记录的
      * "最近一次打开的 png 路径" 通过 glibc real_fopen 重新整读并解码，彻底绕开坏 RWops。 */
-    Sint64 sk0 = SDL_RWseek(src, 0, RW_SEEK_SET);   /* 尽力复位（不可 seek 时静默失败） */
-    fprintf(stderr, "[shim:PNG_RW] seek_ret=%lld\n", (long long)sk0);
+    (void)SDL_RWseek(src, 0, RW_SEEK_SET);
 
     size_t cap = 1 << 16, len = 0;
     unsigned char *buf = (unsigned char *)malloc(cap);
@@ -533,18 +721,13 @@ SDL_Surface *IMG_LoadPNG_RW(SDL_RWops *src, int freesrc) {
         len += (size_t)n;
     }
 
-    SDL_Surface *s = NULL;
-    if (len > 0 && real_IMG_LoadPNG_RW) {
-        SDL_RWops *mem = SDL_RWFromMem(buf, (int)len);
-        if (mem) s = real_IMG_LoadPNG_RW(mem, 1);   /* 调真正的解码器（不递归），此后 mem 被其内部关闭 */
-    }
+    SDL_Surface *s = shim_png_decode_buf(buf, len);
     free(buf);
 
     /* 回退：slurp 为空（RWops 已读空且不可 seek）时，用记录的 png 路径重新打开整读。
      * 仅对文件型 RWops 生效；内存 RWops(type 4/5) 用 stale 路径会解码错文件，跳过。 */
     if (!s && g_last_png_path[0] && real_fopen &&
         src->type != 4 && src->type != 5) {
-        fprintf(stderr, "[shim:PNG_RW] slurp empty; fallback reopen '%s'\n", g_last_png_path);
         FILE *ff = real_fopen(g_last_png_path, "rb");
         if (ff) {
             size_t c2 = 1 << 16, l2 = 0;
@@ -562,10 +745,8 @@ SDL_Surface *IMG_LoadPNG_RW(SDL_RWops *src, int freesrc) {
                     l2 += (size_t)r;
                 }
                 fclose(ff);
-                if (b2 && l2 > 0 && real_IMG_LoadPNG_RW) {
-                    SDL_RWops *mem2 = SDL_RWFromMem(b2, (int)l2);
-                    if (mem2) s = real_IMG_LoadPNG_RW(mem2, 1);
-                }
+                if (b2 && l2 > 0)
+                    s = shim_png_decode_buf(b2, l2);
                 free(b2);
             } else {
                 fclose(ff);
@@ -575,11 +756,130 @@ SDL_Surface *IMG_LoadPNG_RW(SDL_RWops *src, int freesrc) {
 
     /* 关键：src 的所有权始终交还游戏，本 shim 绝不关闭 src。
      * 经验证该游戏在 IMG_LoadPNG_RW 返回后无论成功与否都会自行 SDL_RWclose(src)
-     * （不遵守 freesrc 契约）；若我们在此关闭，成功路径会触发 double free。
-     * mem/mem2 由 real_IMG_LoadPNG_RW(...,1) 内部关闭，与 src 无关。 */
-    fprintf(stderr, "[shim:PNG_RW] decode %s (len=%zu path='%s')\n",
-            s ? "OK" : "FAIL", len, g_last_png_path);
+     * （不遵守 freesrc 契约）；若我们在此关闭，成功路径会触发 double free。 */
+    if (s) g_png_ok_n++;
+    else g_png_fail_n++;
+    if (!s || g_png_ok_n + g_png_fail_n <= 3 || (g_png_fail_n <= 6 && !s))
+        fprintf(stderr, "[shim:PNG_RW] decode %s (len=%zu path='%s' ok=%d fail=%d)\n",
+                s ? "OK" : "FAIL", len, g_last_png_path, g_png_ok_n, g_png_fail_n);
     return s;
+}
+
+/* 游戏 BGM 不走 Mix_LoadMUS(路径)，而是 Get_RWops → 自建 RWops → Mix_LoadMUS_RW。
+ * 自建 seek 返回的是 fseek 成功/失败（0/-1），不是文件位置，SDL_RWtell 恒为 0，
+ * 设备 mixer（minimp3）解不出。这里改走 mixer 默认的 Mix_LoadMUS(路径)。 */
+typedef struct _Mix_Music Mix_Music;
+typedef struct Mix_Chunk Mix_Chunk;
+static Mix_Music *(*real_Mix_LoadMUS)(const char *) = NULL;
+static Mix_Music *(*real_Mix_LoadMUS_RW)(SDL_RWops *, int) = NULL;
+static Mix_Chunk *(*real_Mix_LoadWAV_RW)(SDL_RWops *, int) = NULL;
+static int (*real_Mix_OpenAudio)(int, Uint16, int, int) = NULL;
+static int (*real_Mix_Init)(int) = NULL;
+static int (*real_Mix_Volume)(int, int) = NULL;
+static int (*real_Mix_VolumeMusic)(int) = NULL;
+static char g_last_mus_path[4096];
+
+static int shim_is_music_path(const char *path) {
+    const char *e;
+    if (!path || !(e = strrchr(path, '.')))
+        return 0;
+    return !strcasecmp(e, ".mp3") || !strcasecmp(e, ".ogg") ||
+           !strcasecmp(e, ".wav") || !strcasecmp(e, ".mid") ||
+           !strcasecmp(e, ".flac");
+}
+
+static void shim_note_audio_path(const char *path) {
+    if (!shim_is_music_path(path))
+        return;
+    strncpy(g_last_mus_path, path, sizeof(g_last_mus_path) - 1);
+    g_last_mus_path[sizeof(g_last_mus_path) - 1] = '\0';
+}
+
+static void shim_resolve_mix(void) {
+    if (real_Mix_LoadMUS && real_Mix_OpenAudio) return;
+    void *h = dlopen("/usr/lib/libSDL2_mixer-2.0.so.0", RTLD_LAZY | RTLD_NOLOAD);
+    if (!h) h = dlopen("libSDL2_mixer.so", RTLD_LAZY);
+    if (h) {
+        real_Mix_LoadMUS = (Mix_Music *(*)(const char *))dlsym(h, "Mix_LoadMUS");
+        real_Mix_LoadMUS_RW = (Mix_Music *(*)(SDL_RWops *, int))dlsym(h, "Mix_LoadMUS_RW");
+        real_Mix_LoadWAV_RW = (Mix_Chunk *(*)(SDL_RWops *, int))dlsym(h, "Mix_LoadWAV_RW");
+        real_Mix_OpenAudio = (int (*)(int, Uint16, int, int))dlsym(h, "Mix_OpenAudio");
+        real_Mix_Init = (int (*)(int))dlsym(h, "Mix_Init");
+        real_Mix_Volume = (int (*)(int, int))dlsym(h, "Mix_Volume");
+        real_Mix_VolumeMusic = (int (*)(int))dlsym(h, "Mix_VolumeMusic");
+    }
+    if (!real_Mix_LoadMUS)
+        real_Mix_LoadMUS = (Mix_Music *(*)(const char *))dlsym(RTLD_NEXT, "Mix_LoadMUS");
+    if (!real_Mix_LoadMUS_RW)
+        real_Mix_LoadMUS_RW = (Mix_Music *(*)(SDL_RWops *, int))dlsym(RTLD_NEXT, "Mix_LoadMUS_RW");
+    if (!real_Mix_LoadWAV_RW)
+        real_Mix_LoadWAV_RW = (Mix_Chunk *(*)(SDL_RWops *, int))dlsym(RTLD_NEXT, "Mix_LoadWAV_RW");
+    if (!real_Mix_OpenAudio)
+        real_Mix_OpenAudio = (int (*)(int, Uint16, int, int))dlsym(RTLD_NEXT, "Mix_OpenAudio");
+}
+
+Mix_Music *Mix_LoadMUS(const char *file) {
+    shim_resolve_mix();
+    const char *p = file;
+    if (file && !sw_file_exists(file)) {
+        const char *found = sw_find_data_file(file);
+        if (found && sw_file_exists(found))
+            p = found;
+    }
+    Mix_Music *m = real_Mix_LoadMUS ? real_Mix_LoadMUS(p) : NULL;
+    fprintf(stderr, "[shim:MUS] '%s' -> '%s' %s err=%s\n",
+            file ? file : "", p ? p : "", m ? "OK" : "FAIL", SDL_GetError());
+    return m;
+}
+
+Mix_Music *Mix_LoadMUS_RW(SDL_RWops *src, int freesrc) {
+    shim_resolve_mix();
+    Mix_Music *m = NULL;
+    if (g_last_mus_path[0] && sw_file_exists(g_last_mus_path) && real_Mix_LoadMUS) {
+        m = real_Mix_LoadMUS(g_last_mus_path);
+        fprintf(stderr, "[shim:MUS_RW] default LoadMUS('%s') -> %s err=%s\n",
+                g_last_mus_path, m ? "OK" : "FAIL", SDL_GetError());
+    }
+    if (!m && real_Mix_LoadMUS_RW) {
+        m = real_Mix_LoadMUS_RW(src, 0);
+        fprintf(stderr, "[shim:MUS_RW] native RW src=%p -> %s err=%s\n",
+                (void *)src, m ? "OK" : "FAIL", SDL_GetError());
+    }
+    if (src && freesrc)
+        SDL_RWclose(src);
+    return m;
+}
+
+Mix_Chunk *Mix_LoadWAV_RW(SDL_RWops *src, int freesrc) {
+    shim_resolve_mix();
+    Mix_Chunk *c = real_Mix_LoadWAV_RW ? real_Mix_LoadWAV_RW(src, freesrc) : NULL;
+    fprintf(stderr, "[shim:WAV_RW] src=%p freesrc=%d -> %s err=%s\n",
+            (void *)src, freesrc, c ? "OK" : "FAIL",
+            c ? "-" : SDL_GetError());
+    return c;
+}
+
+int Mix_OpenAudio(int freq, Uint16 format, int channels, int chunksize) {
+    shim_resolve_mix();
+    if (!SDL_WasInit(SDL_INIT_AUDIO)) {
+        if (SDL_InitSubSystem(SDL_INIT_AUDIO) != 0)
+            fprintf(stderr, "[shim:MIX] SDL_Init(AUDIO) failed: %s\n", SDL_GetError());
+    }
+    if (real_Mix_Init) {
+        int flags = real_Mix_Init(0x00000008); /* MIX_INIT_MP3 */
+        fprintf(stderr, "[shim:MIX] Mix_Init(MP3) -> 0x%x err=%s\n",
+                flags, SDL_GetError());
+    }
+    int r = real_Mix_OpenAudio ? real_Mix_OpenAudio(freq, format, channels, chunksize) : -1;
+    fprintf(stderr, "[shim:MIX] OpenAudio(%d,0x%x,ch=%d,chunk=%d) -> %d driver=%s err=%s\n",
+            freq, (unsigned)format, channels, chunksize, r,
+            SDL_GetCurrentAudioDriver() ? SDL_GetCurrentAudioDriver() : "?",
+            r != 0 ? SDL_GetError() : "-");
+    if (r == 0 && real_Mix_VolumeMusic && real_Mix_VolumeMusic(-1) == 0)
+        real_Mix_VolumeMusic(128);
+    if (r == 0 && real_Mix_Volume && real_Mix_Volume(-1, -1) == 0)
+        real_Mix_Volume(-1, 128);
+    return r;
 }
 
 /* ---- TTF 字体加载诊断 + 兜底（v10/v11）：定位并修复 CT.ttf 崩溃 ----
@@ -598,6 +898,15 @@ static TTF_Font *(*real_TTF_OpenFontRW)(SDL_RWops *, int, int) = NULL;
 static const char *(*real_TTF_GetError)(void) = NULL;
 static int g_ttf_ready = 0;
 
+static int shim_ttf_verbose(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("SHIM_DUMP_TTF");
+        v = (e && *e && *e != '0') ? 1 : 0;
+    }
+    return v;
+}
+
 static void shim_resolve_ttf(void) {
     if (g_ttf_ready) return;
     g_ttf_ready = 1;
@@ -612,10 +921,11 @@ static void shim_resolve_ttf(void) {
             if (!real_TTF_OpenFont) real_TTF_OpenFont = (TTF_Font *(*)(const char *, int))dlsym(h, "TTF_OpenFont");
         }
     }
-    fprintf(stderr, "[shim:TTF] resolve OpenFont=%s OpenFontRW=%s GetError=%s\n",
-            real_TTF_OpenFont ? "yes" : "NO",
-            real_TTF_OpenFontRW ? "yes" : "NO",
-            real_TTF_GetError ? "yes" : "NO");
+    if (shim_ttf_verbose())
+        fprintf(stderr, "[shim:TTF] resolve OpenFont=%s OpenFontRW=%s GetError=%s\n",
+                real_TTF_OpenFont ? "yes" : "NO",
+                real_TTF_OpenFontRW ? "yes" : "NO",
+                real_TTF_GetError ? "yes" : "NO");
 }
 
 static const char *shim_ttf_err(void) {
@@ -630,7 +940,11 @@ static const char *shim_ttf_err(void) {
 static SDL_RWops *shim_load_file_mem(const char *path, unsigned char **out_buf) {
     if (!path || !real_fopen || !out_buf) return NULL;
     FILE *ff = real_fopen(path, "rb");
-    if (!ff) { fprintf(stderr, "[shim:TTF] load_file_mem fopen FAIL '%s'\n", path); return NULL; }
+    if (!ff) {
+        if (shim_ttf_verbose())
+            fprintf(stderr, "[shim:TTF] load_file_mem fopen FAIL '%s'\n", path);
+        return NULL;
+    }
     size_t cap = 1 << 16, len = 0;
     unsigned char *buf = (unsigned char *)malloc(cap);
     if (!buf) { fclose(ff); return NULL; }
@@ -646,11 +960,12 @@ static SDL_RWops *shim_load_file_mem(const char *path, unsigned char **out_buf) 
         len += r;
     }
     fclose(ff);
-    if (len == 0) { free(buf); fprintf(stderr, "[shim:TTF] load_file_mem empty '%s'\n", path); return NULL; }
+    if (len == 0) { free(buf); return NULL; }
     SDL_RWops *mem = SDL_RWFromMem(buf, (int)len);
     if (!mem) { free(buf); return NULL; }
     *out_buf = buf;
-    fprintf(stderr, "[shim:TTF] load_file_mem '%s' -> %zu bytes\n", path, len);
+    if (shim_ttf_verbose())
+        fprintf(stderr, "[shim:TTF] load_file_mem '%s' -> %zu bytes\n", path, len);
     return mem;
 }
 
@@ -660,22 +975,25 @@ TTF_Font *TTF_OpenFont(const char *file, int ptsize) {
 
     /* 兜底：filename 版本失败 → 整读进内存用 mem RWops 重开（绕过可能损坏的文件型 RWops）。 */
     if (!f && file && real_fopen && real_TTF_OpenFontRW) {
-        fprintf(stderr, "[shim:TTF] OpenFont fallback reopen '%s'\n", file);
+        if (shim_ttf_verbose())
+            fprintf(stderr, "[shim:TTF] OpenFont fallback reopen '%s'\n", file);
         unsigned char *buf = NULL;
         SDL_RWops *mem = shim_load_file_mem(file, &buf);
         if (mem) {
             f = real_TTF_OpenFontRW(mem, 0, ptsize);   /* freesrc=0：我们持有 mem/buf */
             SDL_RWclose(mem);
             free(buf);
-            fprintf(stderr, "[shim:TTF] OpenFont fallback '%s' -> %p%s\n",
-                    file, (void *)f, f ? "" : " (STILL NULL)");
+            if (shim_ttf_verbose())
+                fprintf(stderr, "[shim:TTF] OpenFont fallback '%s' -> %p%s\n",
+                        file, (void *)f, f ? "" : " (STILL NULL)");
         }
     }
 
-    fprintf(stderr, "[shim:TTF] OpenFont '%s' pt=%d -> %p%s\n",
-            file ? file : "(null)", ptsize,
-            (void *)f, f ? "" : (real_TTF_OpenFont ? "" : " (no-real) "));
-    if (!f)
+    if (shim_ttf_verbose())
+        fprintf(stderr, "[shim:TTF] OpenFont '%s' pt=%d -> %p%s\n",
+                file ? file : "(null)", ptsize,
+                (void *)f, f ? "" : (real_TTF_OpenFont ? "" : " (no-real) "));
+    if (!f && shim_ttf_verbose())
         fprintf(stderr, "[shim:TTF]   last error: %s\n", shim_ttf_err());
     return f;
 }
@@ -683,26 +1001,29 @@ TTF_Font *TTF_OpenFont(const char *file, int ptsize) {
 TTF_Font *TTF_OpenFontRW(SDL_RWops *src, int freesrc, int ptsize) {
     shim_resolve_ttf();
     TTF_Font *f = real_TTF_OpenFontRW ? real_TTF_OpenFontRW(src, freesrc, ptsize) : NULL;
-    fprintf(stderr, "[shim:TTF] OpenFontRW pt=%d -> %p%s\n", ptsize, (void *)f, f ? "" : "");
+    if (shim_ttf_verbose())
+        fprintf(stderr, "[shim:TTF] OpenFontRW pt=%d -> %p%s\n", ptsize, (void *)f, f ? "" : "");
 
     /* 兜底：RWops 版本失败 → 用 fopen 拦截器登记的"最近一次 .ttf 路径"整读重开。
      * 仅对文件型字体（有路径）生效；内存/资源 RWops 无路径则跳过，不改其行为。 */
     if (!f && g_last_ttf_path[0] && real_fopen && real_TTF_OpenFontRW) {
-        fprintf(stderr, "[shim:TTF] OpenFontRW fallback reopen '%s'\n", g_last_ttf_path);
+        if (shim_ttf_verbose())
+            fprintf(stderr, "[shim:TTF] OpenFontRW fallback reopen '%s'\n", g_last_ttf_path);
         unsigned char *buf = NULL;
         SDL_RWops *mem = shim_load_file_mem(g_last_ttf_path, &buf);
         if (mem) {
             f = real_TTF_OpenFontRW(mem, 0, ptsize);   /* freesrc=0：我们持有 mem/buf */
             SDL_RWclose(mem);
             free(buf);
-            fprintf(stderr, "[shim:TTF] OpenFontRW fallback -> %p%s\n",
-                    (void *)f, f ? "" : " (STILL NULL)");
-        } else {
+            if (shim_ttf_verbose())
+                fprintf(stderr, "[shim:TTF] OpenFontRW fallback -> %p%s\n",
+                        (void *)f, f ? "" : " (STILL NULL)");
+        } else if (shim_ttf_verbose()) {
             fprintf(stderr, "[shim:TTF] OpenFontRW fallback mem NULL (read fail?)\n");
         }
     }
 
-    if (!f)
+    if (!f && shim_ttf_verbose())
         fprintf(stderr, "[shim:TTF]   last error: %s\n", shim_ttf_err());
     return f;
 }
@@ -834,13 +1155,14 @@ static void shim_resolve_ttf_render(void) {
             if (!real_TTF_RenderUNICODE_Solid)   real_TTF_RenderUNICODE_Solid = (SDL_Surface*(*)(TTF_Font*,const Uint16*,SDL_Color))dlsym(h,"TTF_RenderUNICODE_Solid");
             if (!real_TTF_SizeUTF8)              real_TTF_SizeUTF8 = (int(*)(TTF_Font*,const char*,int*,int*))dlsym(h,"TTF_SizeUTF8");
         }
-        fprintf(stderr, "[shim:TTF] resolve-render fallback: Blended=%s Solid=%s Shaded=%s UniBlend=%s UniSolid=%s Size=%s\n",
-                real_TTF_RenderUTF8_Blended?"yes":"NO",
-                real_TTF_RenderUTF8_Solid?"yes":"NO",
-                real_TTF_RenderUTF8_Shaded?"yes":"NO",
-                real_TTF_RenderUNICODE_Blended?"yes":"NO",
-                real_TTF_RenderUNICODE_Solid?"yes":"NO",
-                real_TTF_SizeUTF8?"yes":"NO");
+        if (shim_ttf_verbose())
+            fprintf(stderr, "[shim:TTF] resolve-render fallback: Blended=%s Solid=%s Shaded=%s UniBlend=%s UniSolid=%s Size=%s\n",
+                    real_TTF_RenderUTF8_Blended?"yes":"NO",
+                    real_TTF_RenderUTF8_Solid?"yes":"NO",
+                    real_TTF_RenderUTF8_Shaded?"yes":"NO",
+                    real_TTF_RenderUNICODE_Blended?"yes":"NO",
+                    real_TTF_RenderUNICODE_Solid?"yes":"NO",
+                    real_TTF_SizeUTF8?"yes":"NO");
     }
 }
 
@@ -848,14 +1170,18 @@ SDL_Surface *TTF_RenderUTF8_Blended(TTF_Font *font, const char *text, SDL_Color 
     shim_resolve_ttf_render();
     char *conv = NULL;
     const char *t = shim_ttf_prep_text(text, &conv);
-    fprintf(stderr, "[shim:TTF] RenderUTF8_Blended font=%p enc=%s orig='%.24s'%s\n",
-            (void *)font, g_ttf_enc, text ? text : "(null)", conv ? " (transcode->UTF8)" : "");
-    shim_hexdump("utf8", t, 32);
+    if (shim_ttf_verbose()) {
+        fprintf(stderr, "[shim:TTF] RenderUTF8_Blended font=%p enc=%s orig='%.24s'%s\n",
+                (void *)font, g_ttf_enc, text ? text : "(null)", conv ? " (transcode->UTF8)" : "");
+        shim_hexdump("utf8", t, 32);
+    }
     SDL_Surface *s = real_TTF_RenderUTF8_Blended
         ? real_TTF_RenderUTF8_Blended(font, t, fg) : NULL;
-    fprintf(stderr, "[shim:TTF] RenderUTF8_Blended -> %p %s\n", (void *)s,
-            s ? "(ok)" : "NULL(!)");
-    if (s) fprintf(stderr, "    surf w=%d h=%d\n", s->w, s->h);
+    if (shim_ttf_verbose()) {
+        fprintf(stderr, "[shim:TTF] RenderUTF8_Blended -> %p %s\n", (void *)s,
+                s ? "(ok)" : "NULL(!)");
+        if (s) fprintf(stderr, "    surf w=%d h=%d\n", s->w, s->h);
+    }
     free(conv);
     return s;
 }
@@ -864,14 +1190,18 @@ SDL_Surface *TTF_RenderUTF8_Shaded(TTF_Font *font, const char *text, SDL_Color f
     shim_resolve_ttf_render();
     char *conv = NULL;
     const char *t = shim_ttf_prep_text(text, &conv);
-    fprintf(stderr, "[shim:TTF] RenderUTF8_Shaded font=%p enc=%s orig='%.24s'%s\n",
-            (void *)font, g_ttf_enc, text ? text : "(null)", conv ? " (transcode->UTF8)" : "");
-    shim_hexdump("utf8", t, 32);
+    if (shim_ttf_verbose()) {
+        fprintf(stderr, "[shim:TTF] RenderUTF8_Shaded font=%p enc=%s orig='%.24s'%s\n",
+                (void *)font, g_ttf_enc, text ? text : "(null)", conv ? " (transcode->UTF8)" : "");
+        shim_hexdump("utf8", t, 32);
+    }
     SDL_Surface *s = real_TTF_RenderUTF8_Shaded
         ? real_TTF_RenderUTF8_Shaded(font, t, fg, bg) : NULL;
-    fprintf(stderr, "[shim:TTF] RenderUTF8_Shaded -> %p %s\n", (void *)s,
-            s ? "(ok)" : "NULL(!)");
-    if (s) fprintf(stderr, "    surf w=%d h=%d\n", s->w, s->h);
+    if (shim_ttf_verbose()) {
+        fprintf(stderr, "[shim:TTF] RenderUTF8_Shaded -> %p %s\n", (void *)s,
+                s ? "(ok)" : "NULL(!)");
+        if (s) fprintf(stderr, "    surf w=%d h=%d\n", s->w, s->h);
+    }
     free(conv);
     return s;
 }
@@ -880,49 +1210,63 @@ SDL_Surface *TTF_RenderUTF8_Solid(TTF_Font *font, const char *text, SDL_Color fg
     shim_resolve_ttf_render();
     char *conv = NULL;
     const char *t = shim_ttf_prep_text(text, &conv);
-    fprintf(stderr, "[shim:TTF] RenderUTF8_Solid font=%p enc=%s orig='%.24s'%s\n",
-            (void *)font, g_ttf_enc, text ? text : "(null)", conv ? " (transcode->UTF8)" : "");
-    shim_hexdump("utf8", t, 32);
+    if (shim_ttf_verbose()) {
+        fprintf(stderr, "[shim:TTF] RenderUTF8_Solid font=%p enc=%s orig='%.24s'%s\n",
+                (void *)font, g_ttf_enc, text ? text : "(null)", conv ? " (transcode->UTF8)" : "");
+        shim_hexdump("utf8", t, 32);
+    }
     SDL_Surface *s = real_TTF_RenderUTF8_Solid
         ? real_TTF_RenderUTF8_Solid(font, t, fg) : NULL;
-    fprintf(stderr, "[shim:TTF] RenderUTF8_Solid -> %p %s\n", (void *)s,
-            s ? "(ok)" : "NULL(!)");
-    if (s) fprintf(stderr, "    surf w=%d h=%d\n", s->w, s->h);
+    if (shim_ttf_verbose()) {
+        fprintf(stderr, "[shim:TTF] RenderUTF8_Solid -> %p %s\n", (void *)s,
+                s ? "(ok)" : "NULL(!)");
+        if (s) fprintf(stderr, "    surf w=%d h=%d\n", s->w, s->h);
+    }
     free(conv);
     return s;
 }
 
 SDL_Surface *TTF_RenderUNICODE_Blended(TTF_Font *font, const Uint16 *text, SDL_Color fg) {
     shim_resolve_ttf_render();
-    fprintf(stderr, "[shim:TTF] RenderUNICODE_Blended font=%p\n", (void *)font);
-    shim_hexdump("unicode16", text, 64);  /* 按字节 dump UTF-16 */
+    if (shim_ttf_verbose()) {
+        fprintf(stderr, "[shim:TTF] RenderUNICODE_Blended font=%p\n", (void *)font);
+        shim_hexdump("unicode16", text, 64);
+    }
     SDL_Surface *s = real_TTF_RenderUNICODE_Blended
         ? real_TTF_RenderUNICODE_Blended(font, text, fg) : NULL;
-    fprintf(stderr, "[shim:TTF] RenderUNICODE_Blended -> %p %s\n", (void *)s,
-            s ? "(ok)" : "NULL(!)");
-    if (s) fprintf(stderr, "    surf w=%d h=%d\n", s->w, s->h);
+    if (shim_ttf_verbose()) {
+        fprintf(stderr, "[shim:TTF] RenderUNICODE_Blended -> %p %s\n", (void *)s,
+                s ? "(ok)" : "NULL(!)");
+        if (s) fprintf(stderr, "    surf w=%d h=%d\n", s->w, s->h);
+    }
     return s;
 }
 
 SDL_Surface *TTF_RenderUNICODE_Solid(TTF_Font *font, const Uint16 *text, SDL_Color fg) {
     shim_resolve_ttf_render();
-    fprintf(stderr, "[shim:TTF] RenderUNICODE_Solid font=%p\n", (void *)font);
-    shim_hexdump("unicode16", text, 64);
+    if (shim_ttf_verbose()) {
+        fprintf(stderr, "[shim:TTF] RenderUNICODE_Solid font=%p\n", (void *)font);
+        shim_hexdump("unicode16", text, 64);
+    }
     SDL_Surface *s = real_TTF_RenderUNICODE_Solid
         ? real_TTF_RenderUNICODE_Solid(font, text, fg) : NULL;
-    fprintf(stderr, "[shim:TTF] RenderUNICODE_Solid -> %p %s\n", (void *)s,
-            s ? "(ok)" : "NULL(!)");
-    if (s) fprintf(stderr, "    surf w=%d h=%d\n", s->w, s->h);
+    if (shim_ttf_verbose()) {
+        fprintf(stderr, "[shim:TTF] RenderUNICODE_Solid -> %p %s\n", (void *)s,
+                s ? "(ok)" : "NULL(!)");
+        if (s) fprintf(stderr, "    surf w=%d h=%d\n", s->w, s->h);
+    }
     return s;
 }
 
 int TTF_SizeUTF8(TTF_Font *font, const char *text, int *w, int *h) {
     shim_resolve_ttf_render();
-    fprintf(stderr, "[shim:TTF] SizeUTF8 font=%p text='%.20s'\n",
-            (void *)font, text ? text : "(null)");
+    if (shim_ttf_verbose())
+        fprintf(stderr, "[shim:TTF] SizeUTF8 font=%p text='%.20s'\n",
+                (void *)font, text ? text : "(null)");
     int ret = real_TTF_SizeUTF8 ? real_TTF_SizeUTF8(font, text, w, h) : -1;
-    fprintf(stderr, "[shim:TTF] SizeUTF8 -> %d w=%d h=%d\n",
-            ret, w ? *w : -1, h ? *h : -1);
+    if (shim_ttf_verbose())
+        fprintf(stderr, "[shim:TTF] SizeUTF8 -> %d w=%d h=%d\n",
+                ret, w ? *w : -1, h ? *h : -1);
     return ret;
 }
 
@@ -1215,27 +1559,34 @@ const char *fileIO_GetResourcePath(void *self, const char *name) {
     const char *rel = name;
     while (*rel == '/') rel++;
     snprintf(buf, sizeof(buf), "%s/assets/Resource/%s", sw_gamedir(), rel);
+    if (!sw_file_exists(buf)) {
+        const char *found = sw_find_data_file(rel);
+        if (found && sw_file_exists(found)) {
+            strncpy(buf, found, sizeof(buf) - 1);
+            buf[sizeof(buf) - 1] = 0;
+        }
+    }
     fprintf(stderr, "[swpath] GetResourcePath '%s' -> '%s'\n", name, buf);
     return buf;
 }
 
-/* ---- task1: 4 APKX free functions for RoleDataBase data loading ----
- * Engine libSWD3E.so RoleDataBase loader (link-time +0x142110) uses these 4 free
- * functions for APK resource resolution (orig Android used AAssetManager; glibc port
- * resources are flat under $GAMEDIR/assets/). Device /tmp/s3/assets/ has path.dat /
- * all_char.act etc., so map: path = $GAMEDIR/assets/<name>, len = stat size, off = 0.
- * Single const char* param lands in ARM64 x0, matching engine reference. Static buffer
- * return (load-time single-threaded, same pattern as sw_path_write / fileIO_GetResourcePath).
+/* ---- ACT / APKX 数据文件（RoleDataBase / PathDataBase / StoryDataBase）----
+ * 引擎 OpenDataFiles() 调 fileIO::GetACTPath("maps.dat"|"path.dat"|"talk1.dat")。
+ * 原实现：拼 fileIO 对象里的 ACT 根（init 时 = GetTargetPath = $GAMEDIR）+ 文件名，
+ * 再 GetAndroidFileIsExists（JNI，glibc 上 methodID=NULL → 恒返回 0），失败则
+ * Android_APKX_SetFile（同样 JNI 失败）并把路径写成空（path[0]=0,path[1]=0）。
+ * fCreateFile 收到空路径 → fopen("") → "RoleDataBase init Failed." → SIGSEGV。
  *
- * Per team-lead instruction (task① final): these are plain C free functions, exactly
- * like the 7 existing getters (GetAPKXPath / GetAPKXreadpath / GetSDCardPath ...), which
- * are compiled as C and exported UNMANGLED and are proven working on-device. The engine
- * (libSWD3E.so) references them by their unmangled names, so NO extern "C" and NO
- * __attribute__((alias)) mangled-name exports are added here (that would conflict with
- * the plain-C export and is unnecessary — the engine resolves the unmangled symbol).
- * The .vers file is unchanged (no "local: *;"), so these new global symbols are exported
- * by default. Static-buffer returns are safe because the loader uses them single-threaded
- * at resource-load time, same pattern as sw_path_write / fileIO_GetResourcePath. */
+ * 真机 assets/ 下是扁平文件（path.dat / maps.dat / all_char.act …），不是 APK。
+ * GetACTPath 直接映射到 $GAMEDIR/assets/<name>。
+ * GetAPKXFileLenv / GetAPKXFileOffsetv 是无参 JNI 包装（查“当前 SetFile 的文件”），
+ * 签名是 void，不是 const char*。 */
+
+static int sw_file_exists(const char *path) {
+    struct stat st;
+    return path && *path && stat(path, &st) == 0 && S_ISREG(st.st_mode);
+}
+
 static void apkx_path(const char *name, char *out, size_t outsz) {
     const char *base = sw_gamedir();
     const char *rel = name ? name : "";
@@ -1243,50 +1594,114 @@ static void apkx_path(const char *name, char *out, size_t outsz) {
     snprintf(out, outsz, "%s/assets/%s", base, rel);
 }
 
-const char *GetResourceAPKX(const char *name) {
+/* 在 $GAMEDIR/assets、<name>、$GAMEDIR 下找数据文件。返回静态缓冲。 */
+static const char *sw_find_data_file(const char *name) {
     static char buf[4096];
-    apkx_path(name, buf, sizeof(buf));
-    const char *ret = buf;
-    if (g_dump_open)
-        fprintf(stderr, "[shim:APKX] GetResourceAPKX name=%s -> %s\n",
-                name ? name : "(null)", ret ? ret : "(null)");
-    return ret;
+    const char *base = sw_gamedir();
+    if (!name || !*name) { buf[0] = 0; return buf; }
+
+    /* 绝对路径：先原样，缺失则把 /Music/ /Resource/ 补到 assets/ 下。 */
+    if (name[0] == '/') {
+        if (sw_file_exists(name)) {
+            strncpy(buf, name, sizeof(buf) - 1);
+            buf[sizeof(buf) - 1] = 0;
+            return buf;
+        }
+        const char *ins = strstr(name, "/Music/");
+        if (!ins) ins = strstr(name, "/Resource/");
+        if (!ins) ins = strstr(name, "/zh-Hant/");
+        if (!ins) ins = strstr(name, "/zh-Hans/");
+        if (ins) {
+            snprintf(buf, sizeof(buf), "%s/assets%s", base, ins);
+            if (sw_file_exists(buf)) return buf;
+        }
+        name = strrchr(name, '/') + 1;
+    }
+
+    const char *rel = name;
+    while (*rel == '/') rel++;
+    if (!*rel) { buf[0] = 0; return buf; }
+    if (rel[0] == '.' && rel[1] == '/')
+        rel += 2;
+    snprintf(buf, sizeof(buf), "%s/assets/%s", base, rel);
+    if (sw_file_exists(buf)) return buf;
+    snprintf(buf, sizeof(buf), "%s/%s", base, rel);
+    if (sw_file_exists(buf)) return buf;
+    snprintf(buf, sizeof(buf), "%s/assets/Resource/%s", base, rel);
+    if (sw_file_exists(buf)) return buf;
+    snprintf(buf, sizeof(buf), "%s/assets/Music/%s", base, rel);
+    if (sw_file_exists(buf)) return buf;
+    snprintf(buf, sizeof(buf), "%s/assets/zh-Hant/%s", base, rel);
+    if (sw_file_exists(buf)) return buf;
+    snprintf(buf, sizeof(buf), "%s/assets/zh-Hans/%s", base, rel);
+    if (sw_file_exists(buf)) return buf;
+    /* 即使不存在也回到 assets/，让后续 fopen 打出真实路径而不是空串 */
+    snprintf(buf, sizeof(buf), "%s/assets/%s", base, rel);
+    return buf;
 }
 
-long GetAPKXFileLen(const char *name) {
-    char path[4096];
-    apkx_path(name, path, sizeof(path));
+const char *fileIO_GetACTPath(void *self, const char *name) {
+    const char *found = sw_find_data_file(name);
+    fprintf(stderr, "[swpath] GetACTPath '%s' -> '%s'%s\n",
+            name ? name : "", found, sw_file_exists(found) ? "" : " (MISSING)");
+    if (self) {
+        strncpy((char *)self, found, 2047);
+        ((char *)self)[2047] = 0;
+        return (const char *)self;
+    }
+    return found;
+}
+
+int GetAndroidFileIsExists(const char *path) {
+    int ok = 0;
+    if (path && *path) {
+        if (sw_file_exists(path))
+            ok = 1;
+        else {
+            const char *found = sw_find_data_file(path);
+            ok = (found && sw_file_exists(found));
+        }
+    }
+    fprintf(stderr, "[shim:EXISTS] '%s' -> %d\n", path ? path : "", ok);
+    return ok;
+}
+
+int Android_APKX_SetFile(const char *name, const char *mode) {
+    (void)mode;
+    const char *found = sw_find_data_file(name);
+    strncpy(g_apkx_current, found, sizeof(g_apkx_current) - 1);
+    g_apkx_current[sizeof(g_apkx_current) - 1] = 0;
+    int ok = sw_file_exists(g_apkx_current);
+    if (!ok && found && *found) {
+        struct stat st;
+        if (stat(found, &st) == 0 && S_ISDIR(st.st_mode)) {
+            char inside[4096];
+            snprintf(inside, sizeof(inside), "%s/StringDB.txt", found);
+            if (sw_file_exists(inside)) {
+                strncpy(g_apkx_current, inside, sizeof(g_apkx_current) - 1);
+                g_apkx_current[sizeof(g_apkx_current) - 1] = 0;
+                ok = 1;
+            }
+        }
+    }
+    fprintf(stderr, "[shim:APKX] SetFile name='%s' -> '%s' ok=%d\n",
+            name ? name : "", g_apkx_current, ok);
+    return ok ? 1 : 0;
+}
+
+/* 引擎符号 _Z14GetAPKXFileLenv / _Z17GetAPKXFileOffsetv：无参，查当前 SetFile。 */
+long GetAPKXFileLenv(void) {
     struct stat st;
-    long ret = (stat(path, &st) == 0) ? (long)st.st_size : -1L;
-    if (g_dump_open)
-        fprintf(stderr, "[shim:APKX] GetAPKXFileLen name=%s -> %ld\n",
-                name ? name : "(null)", ret);
+    long ret = (g_apkx_current[0] && stat(g_apkx_current, &st) == 0)
+                   ? (long)st.st_size : 0L;
+    fprintf(stderr, "[shim:APKX] FileLenv('%s') -> %ld\n", g_apkx_current, ret);
     return ret;
 }
 
-long GetAPKXFileOffset(const char *name) {
-    (void)name;
-    long ret = 0L;   /* resources are flat under assets/, no in-APK offset */
-    if (g_dump_open)
-        fprintf(stderr, "[shim:APKX] GetAPKXFileOffset name=%s -> %ld\n",
-                name ? name : "(null)", ret);
-    return ret;
+long GetAPKXFileOffsetv(void) {
+    fprintf(stderr, "[shim:APKX] FileOffsetv('%s') -> 0\n", g_apkx_current);
+    return 0L;
 }
-
-long GetAPKXFileLenv(const char *name) {
-    char path[4096];
-    apkx_path(name, path, sizeof(path));
-    struct stat st;
-    long ret = (stat(path, &st) == 0) ? (long)st.st_size : -1L;
-    if (g_dump_open)
-        fprintf(stderr, "[shim:APKX] GetAPKXFileLenv name=%s -> %ld\n",
-                name ? name : "(null)", ret);
-    return ret;
-}
-
-/* No mangled-name aliases are exported for these 4 functions: the engine references
- * them by their unmangled C names (same as the 7 existing getters), so plain C linkage
- * is sufficient and correct. Adding __attribute__((alias)) is NOT done per task① spec. */
 
 /* ---- SMPEG_* 过场动画解码桩（libsmpeg2 在 glibc 上无法加载，这里安全空操作）----
  * 用静态哑 handle 满足“非 NULL”约定；SMPEG_status 返回 STOPPED 让游戏跳过过场。 */

@@ -64,9 +64,29 @@ EGLBoolean egl_shim_SurfaceAttrib(EGLDisplay dpy, EGLSurface s, EGLint a,
 
 // Access SDL window from outside (for ANativeWindow shim)
 struct SDL_Window *egl_shim_get_window(void);
+struct SDL_Window *egl_shim_SDL_CreateWindow(const char *title, int x, int y,
+                                             int w, int h, unsigned int flags);
+void egl_shim_SDL_DestroyWindow(struct SDL_Window *w);
+void egl_shim_SDL_Quit(void);
+int egl_shim_SDL_Init(unsigned int flags);
+void egl_shim_SDL_GetWindowSize(struct SDL_Window *w, int *width, int *height);
+int egl_shim_SDL_SetWindowFullscreen(struct SDL_Window *w, unsigned int flags);
+int egl_shim_SDL_SetWindowDisplayMode(struct SDL_Window *w, const void *mode);
+int egl_shim_SDL_GetCurrentDisplayMode(int displayIndex, void *mode);
+int egl_shim_SDL_GetDesktopDisplayMode(int displayIndex, void *mode);
+int egl_shim_SDL_GetDisplayMode(int displayIndex, int modeIndex, void *mode);
+int egl_shim_SDL_GetDisplayBounds(int displayIndex, void *rect);
+void *egl_shim_SDL_CreateRenderer(struct SDL_Window *w, int index, unsigned int flags);
+int egl_shim_SDL_RenderSetLogicalSize(void *renderer, int w, int h);
+int egl_shim_SDL_VideoInit(const char *name);
+int egl_shim_SDL_AudioInit(const char *name);
+void egl_shim_SDL_AudioQuit(void);
+void egl_shim_map_logical_viewport(int *x, int *y, int *w, int *h);
 
 // Pre-create the SDL window+context from main thread
 void egl_shim_create_window(void);
+void egl_shim_tls_pin(void);
+void egl_shim_tls_restore(void);
 
 // Mutex hooks — call from pthread_mutex_lock/unlock wrappers
 // to detect outermost EndCriticalSectionGL and release GL

@@ -19,29 +19,76 @@
 #include "egl_shim.h"
 #include "util.h"
 
-/* Resolucao DINAMICA (qualquer device): desktop mode do SDL com fallback
- * 1280x720. Exportada p/ imports.c (ANativeWindow_getWidth/Height — o que o
- * JOGO le) e android_shim.c (clamp do cursor). */
-int egl_shim_screen_w = 1280, egl_shim_screen_h = 720;
+/* egl_shim_win_*   = 真窗口 / drawable（SDL 测面板，不写死设备分辨率）
+ * egl_shim_screen_* = 报给游戏的逻辑分辨率（引擎原生 640×480 4:3）
+ * GetWindowSize / DisplayMode / ANativeWindow 一律走 screen_*，再靠
+ * SDL_RenderSetLogicalSize 等比例放大到 win_*（16:9 左右黑边，4:3 铺满）。 */
+int egl_shim_screen_w = 0, egl_shim_screen_h = 0;
+int egl_shim_win_w = 0, egl_shim_win_h = 0;
 #define SCREEN_WIDTH egl_shim_screen_w
 #define SCREEN_HEIGHT egl_shim_screen_h
 
-/* 与 imports.c 的 g_summertime_screen_w/h 同步：游戏经
- * ANativeWindow_getWidth/Height 读到的是这个值；egl_shim 在算出设备原生分辨率
- * 后把它写回，保证游戏看到的窗口尺寸 = 真实 SDL2 窗口尺寸。 */
 extern int g_summertime_screen_w, g_summertime_screen_h;
+
+static void sync_reported_geometry(int w, int h) {
+  if (w <= 0 || h <= 0)
+    return;
+  egl_shim_screen_w = w;
+  egl_shim_screen_h = h;
+  g_summertime_screen_w = w;
+  g_summertime_screen_h = h;
+}
+
+static int query_display_size(int *w, int *h) {
+  SDL_DisplayMode dm;
+  int dw = 0, dh = 0;
+  if (SDL_GetCurrentDisplayMode(0, &dm) == 0 && dm.w > 0 && dm.h > 0) {
+    dw = dm.w;
+    dh = dm.h;
+    debugPrintf("egl_shim: current display %dx%d\n", dw, dh);
+  }
+  if (SDL_GetDesktopDisplayMode(0, &dm) == 0 && dm.w > 0 && dm.h > 0) {
+    debugPrintf("egl_shim: desktop mode %dx%d\n", dm.w, dm.h);
+    if (!dw) {
+      dw = dm.w;
+      dh = dm.h;
+    }
+  }
+  if (dw <= 0 || dh <= 0)
+    return 0;
+  *w = dw;
+  *h = dh;
+  return 1;
+}
 
 /* A engine (bionic) lê a stack-canary de tpidr_el0+0x28 (TLS_SLOT_STACK_GUARD).
  * Sob glibc esse offset colide com uma TLS var que o Mali/SDL escreve no
  * MakeCurrent/CreateContext -> a canary "muda" no meio da função -> stack smash
- * FALSO-POSITIVO. Salvamos/restauramos tpidr+0x28 ao redor das chamadas SDL_GL
- * p/ a engine ver o guard ESTÁVEL. */
+ * FALSO-POSITIVO. 进程内钉死一份 canary，SDL/GL 返回后写回去。 */
+static unsigned long g_tls_canary;
+static int g_tls_canary_set;
+
+void egl_shim_tls_pin(void) {
+  unsigned long tp;
+  __asm__ volatile("mrs %0, tpidr_el0" : "=r"(tp));
+  g_tls_canary = *(unsigned long *)(tp + 0x28);
+  g_tls_canary_set = 1;
+}
+
+void egl_shim_tls_restore(void) {
+  unsigned long tp;
+  if (!g_tls_canary_set)
+    return;
+  __asm__ volatile("mrs %0, tpidr_el0" : "=r"(tp));
+  *(unsigned long *)(tp + 0x28) = g_tls_canary;
+}
+
 static int gl_makecurrent(SDL_Window *w, SDL_GLContext c) {
   unsigned long tp; __asm__ volatile("mrs %0, tpidr_el0" : "=r"(tp));
   unsigned long g = *(unsigned long *)(tp + 0x28);
   int (*f)(SDL_Window *, SDL_GLContext) = &SDL_GL_MakeCurrent;
   int r = f(w, c);
-  *(unsigned long *)(tp + 0x28) = g;
+  *(unsigned long *)(tp + 0x28) = g_tls_canary_set ? g_tls_canary : g;
   return r;
 }
 static SDL_GLContext gl_createcontext(SDL_Window *w) {
@@ -49,7 +96,7 @@ static SDL_GLContext gl_createcontext(SDL_Window *w) {
   unsigned long g = *(unsigned long *)(tp + 0x28);
   SDL_GLContext (*f)(SDL_Window *) = &SDL_GL_CreateContext;
   SDL_GLContext c = f(w);
-  *(unsigned long *)(tp + 0x28) = g;
+  *(unsigned long *)(tp + 0x28) = g_tls_canary_set ? g_tls_canary : g;
   return c;
 }
 
@@ -78,21 +125,225 @@ volatile float summertime_cursor_x = 0, summertime_cursor_y = 0;
 
 SDL_Window *egl_shim_get_window(void) { return egl_window; }
 
-void egl_shim_create_window(void) {
-  /* resolucao nativa do device (TV 1080p, handheld 480p...) c/ fallback 720p */
-  SDL_DisplayMode dm;
-  if (SDL_GetDesktopDisplayMode(0, &dm) == 0 && dm.w > 0 && dm.h > 0) {
-    egl_shim_screen_w = dm.w; egl_shim_screen_h = dm.h;
-    debugPrintf("egl_shim: desktop mode %dx%d\n", dm.w, dm.h);
+static int egl_window_alive(void) {
+  return egl_window && SDL_GetWindowID(egl_window) != 0;
+}
+
+/* 游戏会再调 SDL_CreateWindow / SDL_Quit。真 SDL_Quit 会从 SDL 内部拆掉窗口
+ * （不走游戏 PLT 的 DestroyWindow），留下悬空 egl_window → GetWindowSize=0x0。 */
+SDL_Window *egl_shim_SDL_CreateWindow(const char *title, int x, int y,
+                                      int w, int h, Uint32 flags) {
+  (void)title; (void)x; (void)y; (void)flags;
+  if (!egl_window_alive()) {
+    debugPrintf("egl_shim: window dead (game asked %dx%d), recreating %dx%d\n",
+                w, h, egl_shim_screen_w, egl_shim_screen_h);
+    egl_window = NULL;
+    if (!SDL_WasInit(SDL_INIT_VIDEO))
+      SDL_InitSubSystem(SDL_INIT_VIDEO);
+    egl_shim_create_window();
+  } else {
+    debugPrintf("egl_shim: reuse window (game asked %dx%d, logical %dx%d)\n",
+                w, h, egl_shim_screen_w, egl_shim_screen_h);
   }
-  { const char *e = getenv("SUMMERTIME_RES"); int w, h; /* override opcional */
-    if (e && sscanf(e, "%dx%d", &w, &h) == 2 && w > 0 && h > 0) {
-      egl_shim_screen_w = w; egl_shim_screen_h = h;
-      debugPrintf("egl_shim: SUMMERTIME_RES override %dx%d\n", w, h);
-    } }
-  /* 同步给 imports.c 的 g_summertime_screen_w/h（ANativeWindow_getWidth/Height 读它） */
-  g_summertime_screen_w = egl_shim_screen_w;
-  g_summertime_screen_h = egl_shim_screen_h;
+  egl_shim_tls_restore();
+  return egl_window;
+}
+
+void egl_shim_SDL_DestroyWindow(SDL_Window *w) {
+  if (w && w == egl_window) {
+    debugPrintf("egl_shim: ignore DestroyWindow on port window\n");
+    return;
+  }
+  SDL_DestroyWindow(w);
+}
+
+void egl_shim_SDL_Quit(void) {
+  debugPrintf("egl_shim: ignore SDL_Quit (keep video/window)\n");
+}
+
+int egl_shim_SDL_Init(Uint32 flags) {
+  debugPrintf("egl_shim: SDL_Init(0x%x) already up\n", (unsigned)flags);
+  if (flags & SDL_INIT_AUDIO) {
+    if (!SDL_WasInit(SDL_INIT_AUDIO) && SDL_InitSubSystem(SDL_INIT_AUDIO) != 0)
+      debugPrintf("egl_shim: SDL_InitSubSystem(AUDIO) failed: %s\n", SDL_GetError());
+  }
+  if (flags & SDL_INIT_JOYSTICK) {
+    if (!SDL_WasInit(SDL_INIT_JOYSTICK))
+      SDL_InitSubSystem(SDL_INIT_JOYSTICK);
+  }
+  if (flags & SDL_INIT_GAMECONTROLLER) {
+    if (!SDL_WasInit(SDL_INIT_GAMECONTROLLER))
+      SDL_InitSubSystem(SDL_INIT_GAMECONTROLLER);
+  }
+  return 0;
+}
+
+void egl_shim_SDL_GetWindowSize(SDL_Window *w, int *width, int *height) {
+  (void)w;
+  if (width) *width = egl_shim_screen_w;
+  if (height) *height = egl_shim_screen_h;
+  egl_shim_tls_restore();
+}
+
+static void fill_device_mode(SDL_DisplayMode *mode) {
+  if (!mode)
+    return;
+  if (!mode->format)
+    mode->format = SDL_PIXELFORMAT_RGB888;
+  if (!mode->refresh_rate)
+    mode->refresh_rate = 60;
+  if (egl_shim_screen_w > 0 && egl_shim_screen_h > 0) {
+    mode->w = egl_shim_screen_w;
+    mode->h = egl_shim_screen_h;
+  }
+}
+
+int egl_shim_SDL_GetCurrentDisplayMode(int displayIndex, void *mode) {
+  SDL_DisplayMode *m = (SDL_DisplayMode *)mode;
+  int r = SDL_GetCurrentDisplayMode(displayIndex, m);
+  if (r != 0 && m)
+    memset(m, 0, sizeof(*m));
+  fill_device_mode(m);
+  {
+    static int logged;
+    if (!logged++ && m)
+      debugPrintf("egl_shim: GetCurrentDisplayMode -> %dx%d (logical)\n",
+                  m->w, m->h);
+  }
+  return 0;
+}
+
+int egl_shim_SDL_GetDesktopDisplayMode(int displayIndex, void *mode) {
+  SDL_DisplayMode *m = (SDL_DisplayMode *)mode;
+  int r = SDL_GetDesktopDisplayMode(displayIndex, m);
+  if (r != 0 && m)
+    memset(m, 0, sizeof(*m));
+  fill_device_mode(m);
+  return 0;
+}
+
+int egl_shim_SDL_GetDisplayMode(int displayIndex, int modeIndex, void *mode) {
+  SDL_DisplayMode *m = (SDL_DisplayMode *)mode;
+  int r = SDL_GetDisplayMode(displayIndex, modeIndex, m);
+  if (r != 0 && m)
+    memset(m, 0, sizeof(*m));
+  fill_device_mode(m);
+  return 0;
+}
+
+int egl_shim_SDL_GetDisplayBounds(int displayIndex, void *rect) {
+  SDL_Rect *r = (SDL_Rect *)rect;
+  (void)SDL_GetDisplayBounds(displayIndex, r);
+  if (r && egl_shim_screen_w > 0 && egl_shim_screen_h > 0) {
+    r->x = 0;
+    r->y = 0;
+    r->w = egl_shim_screen_w;
+    r->h = egl_shim_screen_h;
+  }
+  return 0;
+}
+
+void *egl_shim_SDL_CreateRenderer(SDL_Window *w, int index, Uint32 flags) {
+  if (!w) w = egl_window;
+  SDL_Renderer *r = SDL_CreateRenderer(w, index, flags);
+  if (r && egl_shim_screen_w > 0 && egl_shim_screen_h > 0) {
+    SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "linear");
+    SDL_RenderSetLogicalSize(r, egl_shim_screen_w, egl_shim_screen_h);
+    debugPrintf("egl_shim: CreateRenderer logical=%dx%d on drawable %dx%d\n",
+                egl_shim_screen_w, egl_shim_screen_h, egl_shim_win_w, egl_shim_win_h);
+  } else if (!r) {
+    debugPrintf("egl_shim: CreateRenderer FAILED: %s\n", SDL_GetError());
+  }
+  return r;
+}
+
+int egl_shim_SDL_RenderSetLogicalSize(void *renderer, int w, int h) {
+  int use_w = egl_shim_screen_w > 0 ? egl_shim_screen_w : w;
+  int use_h = egl_shim_screen_h > 0 ? egl_shim_screen_h : h;
+  if (w != use_w || h != use_h)
+    debugPrintf("egl_shim: RenderSetLogicalSize %dx%d -> logical %dx%d\n",
+                w, h, use_w, use_h);
+  return SDL_RenderSetLogicalSize((SDL_Renderer *)renderer, use_w, use_h);
+}
+
+void egl_shim_map_logical_viewport(int *x, int *y, int *w, int *h) {
+  int dw = egl_shim_win_w, dh = egl_shim_win_h;
+  int lw = egl_shim_screen_w, lh = egl_shim_screen_h;
+  if (egl_window)
+    SDL_GL_GetDrawableSize(egl_window, &dw, &dh);
+  if (lw <= 0 || lh <= 0 || dw <= 0 || dh <= 0)
+    return;
+  float sx = (float)dw / (float)lw;
+  float sy = (float)dh / (float)lh;
+  float s = sx < sy ? sx : sy;
+  int vw = (int)((float)lw * s + 0.5f);
+  int vh = (int)((float)lh * s + 0.5f);
+  int ox = (dw - vw) / 2;
+  int oy = (dh - vh) / 2;
+  int ix = x ? *x : 0, iy = y ? *y : 0, iw = w ? *w : lw, ih = h ? *h : lh;
+  if (x) *x = ox + (int)((float)ix * s + 0.5f);
+  if (y) *y = oy + (int)((float)iy * s + 0.5f);
+  if (w) *w = (int)((float)iw * s + 0.5f);
+  if (h) *h = (int)((float)ih * s + 0.5f);
+}
+
+int egl_shim_SDL_SetWindowFullscreen(SDL_Window *w, Uint32 flags) {
+  (void)w; (void)flags;
+  debugPrintf("egl_shim: ignore SetWindowFullscreen(0x%x)\n", (unsigned)flags);
+  return 0;
+}
+
+int egl_shim_SDL_SetWindowDisplayMode(SDL_Window *w, const void *mode) {
+  (void)w;
+  const SDL_DisplayMode *dm = (const SDL_DisplayMode *)mode;
+  if (dm)
+    debugPrintf("egl_shim: ignore SetWindowDisplayMode %dx%d\n", dm->w, dm->h);
+  return 0;
+}
+
+int egl_shim_SDL_VideoInit(const char *name) {
+  debugPrintf("egl_shim: ignore SDL_VideoInit('%s')\n", name ? name : "(null)");
+  return 0;
+}
+
+int egl_shim_SDL_AudioInit(const char *name) {
+  if (SDL_WasInit(SDL_INIT_AUDIO)) {
+    debugPrintf("egl_shim: SDL_AudioInit('%s') already %s\n",
+                name ? name : "(null)",
+                SDL_GetCurrentAudioDriver() ? SDL_GetCurrentAudioDriver() : "?");
+    return 0;
+  }
+  int r = SDL_AudioInit(name);
+  debugPrintf("egl_shim: SDL_AudioInit('%s') -> %s r=%d err=%s\n",
+              name ? name : "(null)",
+              SDL_GetCurrentAudioDriver() ? SDL_GetCurrentAudioDriver() : "?",
+              r, r ? SDL_GetError() : "-");
+  return r;
+}
+
+void egl_shim_SDL_AudioQuit(void) {
+  debugPrintf("egl_shim: ignore SDL_AudioQuit\n");
+}
+
+static void parse_logical_res(int *lw, int *lh) {
+  /* 引擎原生 640×480（4:3）。SWORD3_RES 只改逻辑分辨率，不改真窗口。 */
+  *lw = 640;
+  *lh = 480;
+  const char *e = getenv("SWORD3_RES");
+  if (!e || !*e) e = getenv("SWORD3_LOGICAL");
+  if (!e || !*e) e = getenv("SUMMERTIME_RES");
+  int w, h;
+  if (e && sscanf(e, "%dx%d", &w, &h) == 2 && w > 0 && h > 0) {
+    *lw = w;
+    *lh = h;
+    debugPrintf("egl_shim: logical override %dx%d\n", w, h);
+  }
+}
+
+void egl_shim_create_window(void) {
+  int disp_w = 0, disp_h = 0;
+  if (!query_display_size(&disp_w, &disp_h))
+    debugPrintf("egl_shim: SDL display query failed, wait for CreateWindow fallback\n");
   SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
   /* contexto ES casa com o SUMMERTIME_GLVER passado pro engine (default 2.0);
    * em GPU ES3 real (Mali-G310) GLVER=3.0 -> contexto ES 3.0 de verdade */
@@ -109,15 +360,43 @@ void egl_shim_create_window(void) {
   SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 8);
   SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
 
-  egl_window = SDL_CreateWindow(
-      PORT_WINDOW_TITLE, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
-      SCREEN_WIDTH, SCREEN_HEIGHT,
-      SDL_WINDOW_OPENGL | SDL_WINDOW_FULLSCREEN);
+  /* 真窗口跟当前面板走 FULLSCREEN_DESKTOP，尺寸以 SDL 测到的为准。 */
+  {
+    int win_w = (disp_w > 0) ? disp_w : 640;
+    int win_h = (disp_h > 0) ? disp_h : 480;
+    egl_window = SDL_CreateWindow(
+        PORT_WINDOW_TITLE, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+        win_w, win_h,
+        SDL_WINDOW_OPENGL | SDL_WINDOW_FULLSCREEN_DESKTOP | SDL_WINDOW_SHOWN);
+  }
+  if (!egl_window && disp_w > 0 && disp_h > 0) {
+    debugPrintf("egl_shim: desktop fullscreen failed (%s), try %dx%d FULLSCREEN\n",
+                SDL_GetError(), disp_w, disp_h);
+    egl_window = SDL_CreateWindow(
+        PORT_WINDOW_TITLE, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+        disp_w, disp_h,
+        SDL_WINDOW_OPENGL | SDL_WINDOW_FULLSCREEN | SDL_WINDOW_SHOWN);
+  }
   if (!egl_window) {
     debugPrintf("egl_shim: SDL_CreateWindow FAILED: %s\n", SDL_GetError());
     return;
   }
-  debugPrintf("egl_shim: Window created %dx%d\n", SCREEN_WIDTH, SCREEN_HEIGHT);
+  {
+    int aw = 0, ah = 0, dw = 0, dh = 0;
+    SDL_GetWindowSize(egl_window, &aw, &ah);
+    SDL_GL_GetDrawableSize(egl_window, &dw, &dh);
+    egl_shim_win_w = dw > 0 ? dw : aw;
+    egl_shim_win_h = dh > 0 ? dh : ah;
+    if (egl_shim_win_w <= 0) egl_shim_win_w = disp_w;
+    if (egl_shim_win_h <= 0) egl_shim_win_h = disp_h;
+    {
+      int lw = 640, lh = 480;
+      parse_logical_res(&lw, &lh);
+      sync_reported_geometry(lw, lh);
+    }
+    debugPrintf("egl_shim: Window created logical %dx%d  SDL %dx%d  drawable %dx%d  display %dx%d\n",
+                egl_shim_screen_w, egl_shim_screen_h, aw, ah, dw, dh, disp_w, disp_h);
+  }
 
   egl_share_root = gl_createcontext(egl_window);
   if (!egl_share_root) {
@@ -339,11 +618,11 @@ static void dys_maybe_screenshot(void) {
   debugPrintf("[shot] %dx%d salvo\n", w, h);
 }
 
-static void cursor_clear_rect(int x, int y, int w, int h) {
+static void cursor_clear_rect(int x, int y, int w, int h, int max_w, int max_h) {
   if (x < 0) { w += x; x = 0; }
   if (y < 0) { h += y; y = 0; }
-  if (x + w > SCREEN_WIDTH) w = SCREEN_WIDTH - x;
-  if (y + h > SCREEN_HEIGHT) h = SCREEN_HEIGHT - y;
+  if (x + w > max_w) w = max_w - x;
+  if (y + h > max_h) h = max_h - y;
   if (w <= 0 || h <= 0)
     return;
   glScissor(x, y, w, h);
@@ -355,24 +634,32 @@ static void draw_port_cursor(void) {
   if (cursor && strcmp(cursor, "0") == 0)
     return;
 
-  int cx = (int)(summertime_cursor_x * (float)SCREEN_WIDTH);
-  int cy = (int)(summertime_cursor_y * (float)SCREEN_HEIGHT);
+  int dw = egl_shim_win_w, dh = egl_shim_win_h;
+  if (egl_window)
+    SDL_GL_GetDrawableSize(egl_window, &dw, &dh);
+  if (dw <= 0 || dh <= 0)
+    return;
+  int vx = 0, vy = 0, vw = egl_shim_screen_w, vh = egl_shim_screen_h;
+  egl_shim_map_logical_viewport(&vx, &vy, &vw, &vh);
+  int cx = vx + (int)(summertime_cursor_x * (float)vw);
+  int cy = vy + (int)(summertime_cursor_y * (float)vh);
   if (cx < 0) cx = 0;
   if (cy < 0) cy = 0;
-  if (cx >= SCREEN_WIDTH) cx = SCREEN_WIDTH - 1;
-  if (cy >= SCREEN_HEIGHT) cy = SCREEN_HEIGHT - 1;
+  if (cx >= dw) cx = dw - 1;
+  if (cy >= dh) cy = dh - 1;
 
+  glViewport(0, 0, dw, dh);
   glEnable(GL_SCISSOR_TEST);
   glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
 
-  int gy = SCREEN_HEIGHT - cy;
+  int gy = dh - cy;
   glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
-  cursor_clear_rect(cx - 9, gy - 1, 19, 3);
-  cursor_clear_rect(cx - 1, gy - 9, 3, 19);
+  cursor_clear_rect(cx - 9, gy - 1, 19, 3, dw, dh);
+  cursor_clear_rect(cx - 1, gy - 9, 3, 19, dw, dh);
 
   glClearColor(1.0f, 1.0f, 1.0f, 1.0f);
-  cursor_clear_rect(cx - 7, gy, 15, 1);
-  cursor_clear_rect(cx, gy - 7, 1, 15);
+  cursor_clear_rect(cx - 7, gy, 15, 1, dw, dh);
+  cursor_clear_rect(cx, gy - 7, 1, 15, dw, dh);
 
   glDisable(GL_SCISSOR_TEST);
 }

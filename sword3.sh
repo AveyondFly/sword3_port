@@ -47,6 +47,7 @@ cd "$GAMEDIR"
 # 改用 bind mount：argv[0] 与 /proc/self/exe 都得到短路径 /tmp/s3，彻底覆盖两条取基址来源；
 # 同时让 gdb 等不会因 symlink 被 canonicalize 而失真。mount 不可用时回退 symlink。
 SHORTLINK="/tmp/s3"
+umount "$SHORTLINK/Music" 2>/dev/null
 umount "$SHORTLINK" 2>/dev/null; rm -rf "$SHORTLINK"
 if ! ( mkdir -p "$SHORTLINK" && mount --bind "$GAMEDIR" "$SHORTLINK" ) 2>/dev/null; then
   rm -rf "$SHORTLINK"; ln -s "$GAMEDIR" "$SHORTLINK"
@@ -70,7 +71,8 @@ exec > >(tee -a "$LOG") 2>&1
 
 # 调试开关：实时打印游戏每一次文件打开（路径+返回值），用于定位 RoleDataBase init
 # 期间的数据源加载失败。定位完成后注释此行即可恢复干净日志。
-export SHIM_DUMP_OPEN=1
+# 需要追 RoleDataBase 空路径时再打开。默认关，避免刷屏把关键日志淹没。
+# export SHIM_DUMP_OPEN=1
 
 # 库搜索路径：同目录放游戏自带 .so（liblog.so 桩等）。
 # Android .so 的 NEEDED（libSDL2.so / libc.so / libm.so / libdl.so / libz.so）在 glibc
@@ -88,7 +90,10 @@ rm -rf "$STAGING"; mkdir -p "$STAGING"
 # 故必须确保 Setting/ 存在且 env2.dat 占位（空文件即可，游戏首次存档会覆盖）。
 # 另：libbionic_shim.so v15 已在代码层对 fseek/fread/ftell/fwrite/rewind/fclose 做 NULL
 # 安全守卫，作为兜底；此处占位保证设置能正常读写持久化。
-mkdir -p "$GAMEDIR/Setting"
+mkdir -p "$GAMEDIR/Setting" "$GAMEDIR/Cache"
+# 真窗口跟 SDL 测到的面板走，不要在这里写死设备分辨率。
+# 报给游戏的是引擎原生 640x480（4:3），再等比例放大（16:9 左右黑边）。
+# 仅调试逻辑分辨率时才设，例如：SWORD3_RES=640x480
 # 仅在缺失时占位：绝不每次启动都清空已存在的真实设置（如把 env.dat 改名而来的 env2.dat）。
 # 覆盖会废掉用户/游戏写回的持久化配置；缺失占位则兜底原始 NULL-fseek 崩溃场景。
 if [ ! -f "$GAMEDIR/Setting/env2.dat" ]; then
@@ -99,8 +104,16 @@ if [ ! -f "$GAMEDIR/Setting/env2.dat" ]; then
     : > "$GAMEDIR/Setting/env2.dat"
   fi
 fi
-# 设备原生 SDL2 全家桶（glibc 原生、ABI 兼容；比 Android 版更稳）。
-# 注意：Android libSDL2.so 在设备上已改名 .android，故 libSDL2.so 只能走此符号链接。
+# 设备原生 SDL2 全家桶（glibc 原生、ABI 兼容）。
+# Android 版 libSDL2.so 不能当 libSDL2.so 用：NEEDED OpenSLES/android，且 E5Plus
+# 缺 glFramebufferTexture2DOES。若仍叫 libSDL2.so，loader 会按绝对路径误载它。
+if [ -f "$GAMEDIR/libSDL2.so" ] && [ ! -L "$GAMEDIR/libSDL2.so" ]; then
+  if [ ! -f "$GAMEDIR/libSDL2.so.android" ]; then
+    mv -f "$GAMEDIR/libSDL2.so" "$GAMEDIR/libSDL2.so.android"
+  else
+    rm -f "$GAMEDIR/libSDL2.so"
+  fi
+fi
 ln -sf /usr/lib/libSDL2-2.0.so.0      "$STAGING/libSDL2.so"
 ln -sf /usr/lib/libSDL2_image-2.0.so.0 "$STAGING/libSDL2_image.so"
 ln -sf /usr/lib/libSDL2_mixer-2.0.so.0 "$STAGING/libSDL2_mixer.so"
@@ -111,6 +124,16 @@ ln -sf /usr/lib/libdl.so.2       "$STAGING/libdl.so"
 ln -sf /usr/lib/libm.so.6        "$STAGING/libm.so"
 ln -sf /usr/lib/libc.so.6        "$STAGING/libc.so"
 ln -sf /usr/lib/libz.so.1        "$STAGING/libz.so"
+# Android 版 libSDL2.so 的 NEEDED：libOpenSLES / libandroid 设备上没有。
+# 旧设备启动器会在这里放同名桩，仓库脚本漏了这一步 → 覆盖 ports/sword3.sh 后
+# dlopen(Android libSDL2.so) 报缺库；glibc 还会按 soname 记住失败，连设备版
+# libSDL2.so 的回退也一起失败。
+if [ -f "$GAMEDIR/libOpenSLES.so" ]; then
+  ln -sf "$GAMEDIR/libOpenSLES.so" "$STAGING/libOpenSLES.so"
+fi
+if [ -f "$GAMEDIR/libandroid.so" ]; then
+  ln -sf "$GAMEDIR/libandroid.so" "$STAGING/libandroid.so"
+fi
 export LD_LIBRARY_PATH="$STAGING:$GAMEDIR:/usr/lib:/usr/lib/aarch64-linux-gnu${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
 # 中文 locale：资源内含 zh-Hans / zh-Hant 两套。默认简体；繁体改 zh_TW.UTF-8。
@@ -131,6 +154,16 @@ export SUMMERTIME_CURSOR=1
 for g in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
   [ -f "$g" ] && echo performance > "$g" 2>/dev/null
 done
+
+# 音频跟其他 SDL2 端口一样：不指定驱动、不指定设备，走系统/PortMaster 默认。
+unset AUDIODEV
+echo "audio: driver=${SDL_AUDIODRIVER:-<sdl-default>} dev=<system-default>"
+
+# 游戏找 $GAMEDIR/Music，文件在 assets/Music。bind 一份给 fCreateFile 原路径。
+if [ -d "$GAMEDIR/assets/Music" ]; then
+  mkdir -p "$GAMEDIR/Music"
+  mount --bind "$GAMEDIR/assets/Music" "$GAMEDIR/Music" 2>/dev/null || true
+fi
 
 # 绝不给设备 SDL2 设 SDL_VIDEODRIVER（铁律）。本端口已用设备 libSDL2-2.0.so.0
 # 顶替游戏自带的 Android libSDL2.so（见上方 STAGING 符号链接），视频/音频由设备

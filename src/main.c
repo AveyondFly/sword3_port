@@ -28,6 +28,7 @@
 #endif
 #include <dirent.h>
 #include <dlfcn.h>
+#include <stdint.h>
 #include <execinfo.h>
 #include <fcntl.h>
 #include <signal.h>
@@ -79,9 +80,12 @@ static const char *SECONDARY_SOS[] = {
     NULL,
 };
 
-/* SDL 窗口尺寸（由 egl_shim 设为设备原生分辨率） */
+/* 设备窗口尺寸（egl_shim 启动时从 SDL 测量，不是写死的 640x480） */
 extern int egl_shim_screen_w;
 extern int egl_shim_screen_h;
+/* 游戏资源/SetMousePos 坐标系，和面板无关 */
+#define SW_NATIVE_W 640
+#define SW_NATIVE_H 480
 
 static void crash_handler(int sig, siginfo_t *info, void *uc) {
   uintptr_t fault = (uintptr_t)info->si_addr;
@@ -171,59 +175,317 @@ static void sw_cpu_performance(void) {
   }
 }
 
-/* #3 + #2 修复：二进制内后台输入线程（参考 gtalcs2 / nfs 的 in-binary exit 范式）。
- *
- * #3 退出：仙剑以鼠标操作为主、自身不轮询手柄，故每帧轮询物理手柄 SELECT+START，
- *         命中即 _exit(0)（不调 teardown、不 kill 外部进程，最可靠）。
- *
- * #2 鼠标模拟：设备无物理鼠标，把游戏手柄映射为鼠标，向【同一 SDL 进程】的事件队列
- *   注入 SDL_MOUSEMOTION / SDL_MOUSEBUTTON / SDL_MOUSEWHEEL，游戏 SDL_main 主循环直接
- *   读到，等价于真实鼠标。映射：
- *     右摇杆 = 精细移动 / 左摇杆 = 慢速移动 / 方向键 = 步进移动
- *     A = 左键 / B = 右键 / L1 = 滚轮上 / R1 = 滚轮下
- *   手柄 evdev 由 SDL 非独占读取，与游戏自身是否开手柄无关。
- *   退出与鼠标模拟合并为单一线程，避免两线程并发调 SDL_GameControllerUpdate 的隐患。 */
-static int   g_mx = 0, g_my = 0;          /* 当前光标位置（屏幕坐标） */
-static int   g_prevA = 0, g_prevB = 0;    /* 按键边沿检测 */
-static int   g_prevL1 = 0, g_prevR1 = 0;
+/* 输入按 PSV 移植 (gitee.com/Moqi01/swd3-e)：
+ *   1) hook commButtonClass::draw 画选框，只读 MainMenu_selectitem
+ *   2) hook UIGamePad::* → ret0，关掉 Android 虚拟摇杆
+ *   3) SDL_PollEvent 把 CONTROLLER 事件原样交给游戏 UpdateJoystick*
+ *   PSV 的 B/菜单没有 loader 补丁：B 转成游戏认的 cancel，菜单靠触摸点图标。
+ *   2023 so 的 cancel 不走手柄键，TakeKey 读 BACK_KEY_CLICK 再 UndoCommand；
+ *   大地图菜单是 mainMouse 点 SS2D+0x380 后 SetVFunctionGroup。
+ *   不模拟鼠标、不吃方向、不写 fMenu / MainMenu_selectitem。
+ *   这台是 Xbox 布局，A/B 不再按 Vita 的圈/叉对调。 */
+#define SW_CMD_BTN_STRIDE 0x60
+#define SW_BTN_ITEM_ID    88
+#define SW_BTN_CLICKED    56
+#define SW_N_MAIN_CMD     7
+#define SW_N_EX_CMD       4
+#define SW_N_OBS_CMD      2
 
-static void sw_push_motion(void) {
-  SDL_Event e; memset(&e, 0, sizeof(e));
-  e.type = SDL_MOUSEMOTION;
-  e.motion.x = g_mx; e.motion.y = g_my;
-  e.motion.xrel = 0; e.motion.yrel = 0;
-  e.motion.state = SDL_GetMouseState(NULL, NULL);
-  e.motion.windowID = 0;
-  SDL_PushEvent(&e);
+static void *sw_sym(const char *name) {
+  return (void *)so_find_addr_safe(name);
 }
 
-static void sw_push_button(Uint8 button, int down) {
-  SDL_Event e; memset(&e, 0, sizeof(e));
-  e.type = down ? SDL_MOUSEBUTTONDOWN : SDL_MOUSEBUTTONUP;
-  e.button.button = button;
-  e.button.state = down ? SDL_PRESSED : SDL_RELEASED;
-  e.button.x = g_mx; e.button.y = g_my;
-  e.button.windowID = 0;
-  SDL_PushEvent(&e);
+static int *sw_menu_select(void) {
+  static int *p;
+  if (!p) p = (int *)sw_sym("MainMenu_selectitem");
+  return p;
 }
 
-static void sw_push_wheel(int y) {
-  SDL_Event e; memset(&e, 0, sizeof(e));
-  e.type = SDL_MOUSEWHEEL;
-  e.wheel.y = y;            /* >0 上滚, <0 下滚 */
-  e.wheel.windowID = 0;
-  SDL_PushEvent(&e);
+static char *sw_cmd_buttons(void) {
+  static char *p;
+  if (!p) p = (char *)sw_sym("mainCommandButton");
+  return p;
+}
+
+static int sw_ptr_in_range(const void *p, const char *base, int n) {
+  return base && (const char *)p >= base &&
+         (const char *)p < base + n * SW_CMD_BTN_STRIDE;
+}
+
+static int sw_is_newui_button(const void *btn) {
+  if (sw_ptr_in_range(btn, sw_cmd_buttons(), SW_N_MAIN_CMD))
+    return 1;
+  if (sw_ptr_in_range(btn, sw_sym("ExCommandButton"), SW_N_EX_CMD))
+    return 1;
+  if (sw_ptr_in_range(btn, sw_sym("ObsoltCommandButton"), SW_N_OBS_CMD))
+    return 1;
+  return 0;
+}
+
+static int sw_btn_is_selected(const void *btn) {
+  unsigned char *force_obs = sw_sym("ForceObsoltMenu");
+  int *obs_sel = sw_sym("ObsoltSel");
+  char *obs = sw_sym("ObsoltCommandButton");
+  if (force_obs && *force_obs == 1 && obs && obs_sel && *obs_sel >= 1)
+    return (const char *)btn == obs + (*obs_sel - 1) * SW_CMD_BTN_STRIDE;
+  int *sel = sw_menu_select();
+  if (!sel)
+    return 0;
+  return *(int *)((const char *)btn + SW_BTN_ITEM_ID) == *sel;
+}
+
+static SDL_Surface *sw_select_surf;
+static int sw_select_w, sw_select_h;
+
+static SDL_Surface *sw_ensure_select_surf(int w, int h) {
+  if (w < 16) w = 80;
+  if (h < 16) h = 80;
+  if (sw_select_surf && sw_select_w == w && sw_select_h == h)
+    return sw_select_surf;
+  if (sw_select_surf)
+    SDL_FreeSurface(sw_select_surf);
+  sw_select_surf = SDL_CreateRGBSurface(0, w, h, 32,
+                                        0x00ff0000, 0x0000ff00, 0x000000ff, 0xff000000);
+  if (!sw_select_surf)
+    return NULL;
+  sw_select_w = w;
+  sw_select_h = h;
+  SDL_FillRect(sw_select_surf, NULL, SDL_MapRGBA(sw_select_surf->format, 0, 0, 0, 0));
+  Uint32 c = SDL_MapRGBA(sw_select_surf->format, 255, 220, 64, 255);
+  int t = 3;
+  SDL_Rect r;
+  r = (SDL_Rect){0, 0, w, t};         SDL_FillRect(sw_select_surf, &r, c);
+  r = (SDL_Rect){0, h - t, w, t};     SDL_FillRect(sw_select_surf, &r, c);
+  r = (SDL_Rect){0, 0, t, h};         SDL_FillRect(sw_select_surf, &r, c);
+  r = (SDL_Rect){w - t, 0, t, h};     SDL_FillRect(sw_select_surf, &r, c);
+  return sw_select_surf;
+}
+
+static void sw_blit_select_frame(void *btn, int x, int y) {
+  void *ss2d = sw_sym("SS2D");
+  if (!ss2d)
+    return;
+  SDL_Surface *dst = *(SDL_Surface **)((char *)ss2d + 8);
+  if (!dst)
+    return;
+  int w = *(int *)((char *)btn + 52);
+  int h = *(int *)((char *)btn + 48);
+  SDL_Surface *src = sw_ensure_select_surf(w, h);
+  if (!src)
+    return;
+  SDL_Rect dr = {x, y, src->w, src->h};
+  SDL_UpperBlit(src, NULL, dst, &dr);
+}
+
+static int (*commButton_draw_orig)(void *this, int x, int y);
+static int (*commButton_drawText_orig)(void *this, int a2, int a3,
+                                       const char *a4, void *color);
+
+static int j_commButton_draw(void *this, int x, int y) {
+  char *btn = this;
+  int newui = sw_is_newui_button(this);
+  unsigned char saved = 0;
+  if (newui && btn) {
+    saved = (unsigned char)btn[SW_BTN_CLICKED];
+    btn[SW_BTN_CLICKED] = 0;
+  }
+  int ret = commButton_draw_orig(this, x, y);
+  if (newui && btn) {
+    btn[SW_BTN_CLICKED] = saved;
+    if (sw_btn_is_selected(this))
+      sw_blit_select_frame(this, x, y);
+  }
+  return ret;
+}
+
+/* PSV: 新 UI 按钮禁用 clicked 文字色，避免 hover 把字刷成确认色。 */
+static int j_commButton_drawText(void *this, int a2, int a3, const char *a4,
+                                 void *color) {
+  if (sw_is_newui_button(this))
+    return commButton_drawText_orig(this, a2, a3, a4, NULL);
+  return commButton_drawText_orig(this, a2, a3, a4, color);
+}
+
+static void *sw_make_draw_tramp(uintptr_t func) {
+  void *p = mmap(NULL, 4096, PROT_READ | PROT_WRITE | PROT_EXEC,
+                 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (p == MAP_FAILED)
+    return NULL;
+  uint32_t *t = p;
+  memcpy(t, (void *)func, 16);
+  t[4] = 0x58000051u;
+  t[5] = 0xd61f0220u;
+  *(uint64_t *)(t + 6) = func + 16;
+  __builtin___clear_cache((char *)p, (char *)p + 32);
+  return p;
+}
+
+static void sw_hook_commbutton_draw(void) {
+  uintptr_t draw = so_find_addr_safe("_ZN15commButtonClass4drawEii");
+  uintptr_t text = so_find_addr_safe(
+      "_ZN15commButtonClass14drawButtonTextEiiPKcP9SDL_Color");
+  if (!draw) {
+    debugPrintf("[patch] commButtonClass::draw not found\n");
+    return;
+  }
+  commButton_draw_orig = sw_make_draw_tramp(draw);
+  if (!commButton_draw_orig) {
+    debugPrintf("[patch] commButtonClass::draw tramp mmap failed\n");
+    return;
+  }
+  hook_arm64(draw, (uintptr_t)j_commButton_draw);
+  debugPrintf("[patch] commButtonClass::draw -> select-box (PSV style)\n");
+  if (text) {
+    commButton_drawText_orig = sw_make_draw_tramp(text);
+    if (commButton_drawText_orig) {
+      hook_arm64(text, (uintptr_t)j_commButton_drawText);
+      debugPrintf("[patch] commButtonClass::drawButtonText -> no clicked color\n");
+    }
+  }
+}
+
+static void sw_hook_uigamepad(void) {
+  static const char *const syms[] = {
+      "_ZN9UIGamePad4initEv",
+      "_ZN9UIGamePad6UpdateEP12SDL_Renderer",
+      "_ZN9UIGamePad7SetModeEi",
+      "_ZN9UIGamePad17CheckStateReleaseEiii",
+      "_ZN9UIGamePad6MotionEiii",
+      "_ZN9UIGamePadC2Ev",
+      "_ZN9UIGamePad5CloseEv",
+  };
+  int i;
+  for (i = 0; i < (int)(sizeof(syms) / sizeof(syms[0])); i++) {
+    uintptr_t a = so_find_addr_safe(syms[i]);
+    if (a) {
+      hook_arm64(a, (uintptr_t)&ret0);
+      debugPrintf("[patch] %s -> ret0\n", syms[i]);
+    }
+  }
+}
+
+/* PSV 把 B 转成 cancel。2023 so 的 cancel 是 BACK_KEY_CLICK，TakeKey 见了会 UndoCommand。
+ * 只在按下置位，由 TakeKey 自己清；松开时清掉会赶在 TakeKey 前面，返回就丢了。 */
+static void sw_psv_cancel(void) {
+  unsigned char *bk = sw_sym("BACK_KEY_CLICK");
+  if (bk)
+    *bk = 1;
+}
+
+/* 大地图在 ShellLoop→PlayConsole，不走 mainMouse。
+ * SetVFunctionGroup 没有 System 组（0 是空操作）。PSV 点图标后游戏会把
+ * fMouseMain/fExecute/… 换成 System* 并 SystemConstruct。Start 只置位，
+ * 由 PlayConsole（野外）或 mainMouse（其它界面）在游戏线程里完成切换。 */
+static int sw_want_sysmenu;
+static void (*mainMouse_orig)(void);
+static void (*PlayConsole_orig)(void *);
+
+static void sw_install_fn(const char *slot, const char *fn) {
+  void **p = sw_sym(slot);
+  void *f = sw_sym(fn);
+  if (p && f)
+    *p = f;
+}
+
+static void sw_open_system_menu(void) {
+  unsigned char *show = sw_sym("isShowMenu");
+  int *in_sys = sw_sym("inMenuSystem");
+  void (*construct)(void);
+
+  if (show && *show)
+    return;
+  if (in_sys && *in_sys)
+    return;
+
+  sw_install_fn("fMouseMain", "_Z12SystemMMousev");
+  sw_install_fn("fMouseSub", "_Z12nullFunctionv");
+  sw_install_fn("fArrowDown", "_Z15SystemArrowDownv");
+  sw_install_fn("fArrowUp", "_Z13SystemArrowUpv");
+  sw_install_fn("fArrowLeft", "_Z15SystemArrowLeftv");
+  sw_install_fn("fArrowRight", "_Z16SystemArrowRightv");
+  sw_install_fn("fPageDown", "_Z14SystemPageDownv");
+  sw_install_fn("fPageUp", "_Z12SystemPageUpv");
+  sw_install_fn("fShiftTab", "_Z13SystemIconChgv");
+  sw_install_fn("fEnd", "_Z9SystemEndv");
+  sw_install_fn("fExecute", "_Z13SystemExecutev");
+  sw_install_fn("fCancel", "_Z11SystemAbortv");
+  sw_install_fn("fRenderWorkSpace", "_Z12SystemRenderv");
+
+  construct = (void (*)(void))sw_sym("_Z15SystemConstructv");
+  if (construct)
+    construct();
+  debugPrintf("[pad] Start -> SystemConstruct inMenuSystem=%d\n",
+              in_sys ? *in_sys : -1);
+}
+
+static void sw_try_open_system_menu(void) {
+  if (!sw_want_sysmenu)
+    return;
+  sw_want_sysmenu = 0;
+  sw_open_system_menu();
+}
+
+static void j_mainMouse(void) {
+  sw_try_open_system_menu();
+  mainMouse_orig();
+}
+
+static void j_PlayConsole(void *ev) {
+  sw_try_open_system_menu();
+  PlayConsole_orig(ev);
+}
+
+static void sw_hook_fn(const char *sym, void **orig, uintptr_t hook, const char *tag) {
+  uintptr_t a = so_find_addr_safe(sym);
+  if (!a) {
+    debugPrintf("[patch] %s not found\n", tag);
+    return;
+  }
+  *orig = sw_make_draw_tramp(a);
+  if (!*orig) {
+    debugPrintf("[patch] %s tramp mmap failed\n", tag);
+    return;
+  }
+  hook_arm64(a, hook);
+  debugPrintf("[patch] %s -> Start=System*\n", tag);
+}
+
+static void sw_hook_sysmenu(void) {
+  sw_hook_fn("_Z9mainMousev", (void **)&mainMouse_orig,
+             (uintptr_t)j_mainMouse, "mainMouse");
+  sw_hook_fn("_Z11PlayConsoleP9SDL_Event", (void **)&PlayConsole_orig,
+             (uintptr_t)j_PlayConsole, "PlayConsole");
+}
+
+static void sw_psv_system_menu(void) {
+  sw_want_sysmenu = 1;
+}
+
+int sw_SDL_PollEvent(SDL_Event *ev) {
+  int r = SDL_PollEvent(ev);
+  if (r > 0 &&
+      (ev->type == SDL_CONTROLLERBUTTONDOWN ||
+       ev->type == SDL_CONTROLLERBUTTONUP)) {
+    /* PSV：Start 屏蔽；B 转成游戏认的 cancel。2023 so 的 B 会走 key22，不是返回。 */
+    if (ev->cbutton.button == SDL_CONTROLLER_BUTTON_B) {
+      if (ev->type == SDL_CONTROLLERBUTTONDOWN)
+        sw_psv_cancel();
+      ev->cbutton.button = (Uint8)-1;
+    } else if (ev->cbutton.button == SDL_CONTROLLER_BUTTON_START) {
+      if (ev->type == SDL_CONTROLLERBUTTONDOWN) {
+        debugPrintf("[pad] Start down (PollEvent)\n");
+        sw_psv_system_menu();
+      }
+      ev->cbutton.button = (Uint8)-1;
+    }
+  }
+  egl_shim_tls_restore();
+  return r;
 }
 
 static void *sw_input_thread(void *arg) {
   (void)arg;
   SDL_GameController *pad = NULL;
-  g_mx = egl_shim_screen_w / 2;
-  g_my = egl_shim_screen_h / 2;
-  const int DEAD = 6000;    /* 摇杆死区 */
-  const int FAST = 16;      /* 右摇杆满偏每帧像素 */
-  const int SLOW = 8;       /* 左摇杆满偏每帧像素 */
-  const int STEP = 10;      /* 方向键每帧步进像素 */
   for (;;) {
     SDL_GameControllerUpdate();
     if (!pad) {
@@ -231,54 +493,25 @@ static void *sw_input_thread(void *arg) {
       for (int i = 0; i < n; i++) {
         if (SDL_IsGameController(i)) {
           pad = SDL_GameControllerOpen(i);
-          if (pad) { debugPrintf("[input] pad opened (idx=%d)\n", i); break; }
+          if (pad) {
+            debugPrintf("[input] pad opened (idx=%d) native joystick path\n", i);
+            break;
+          }
         }
       }
     }
     if (pad) {
-      /* #3：SELECT + START -> 退出 */
-      if (SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_BACK) &&
-          SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_START)) {
+      int start = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_START);
+      int back = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_BACK);
+      static int prev_start;
+      if (start && back) {
         static const char msg[] = "[pad] SELECT+START -> exit\n";
         (void)!write(STDERR_FILENO, msg, sizeof(msg) - 1);
         _exit(0);
       }
-      /* #2 鼠标移动：右摇杆(快) + 左摇杆(慢) + 方向键(步进) */
-      Sint16 rx = SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_RIGHTX);
-      Sint16 ry = SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_RIGHTY);
-      Sint16 lx = SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_LEFTX);
-      Sint16 ly = SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_LEFTY);
-      int dx = 0, dy = 0;
-      if (abs(rx) > DEAD) dx += (rx * FAST) / 32768;
-      if (abs(ry) > DEAD) dy += (ry * FAST) / 32768;
-      if (abs(lx) > DEAD) dx += (lx * SLOW) / 32768;
-      if (abs(ly) > DEAD) dy += (ly * SLOW) / 32768;
-      if (SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_DPAD_LEFT))  dx -= STEP;
-      if (SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_DPAD_RIGHT)) dx += STEP;
-      if (SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_DPAD_UP))    dy -= STEP;
-      if (SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_DPAD_DOWN))  dy += STEP;
-      if (dx || dy) {
-        g_mx += dx; g_my += dy;
-        if (g_mx < 0) g_mx = 0;
-        if (g_mx > egl_shim_screen_w - 1) g_mx = egl_shim_screen_w - 1;
-        if (g_my < 0) g_my = 0;
-        if (g_my > egl_shim_screen_h - 1) g_my = egl_shim_screen_h - 1;
-        sw_push_motion();
-      }
-      /* #2 按键：A=左键 B=右键（边沿触发） */
-      int a = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_A);
-      int b = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_B);
-      if (a && !g_prevA) sw_push_button(SDL_BUTTON_LEFT, 1);
-      if (!a && g_prevA) sw_push_button(SDL_BUTTON_LEFT, 0);
-      if (b && !g_prevB) sw_push_button(SDL_BUTTON_RIGHT, 1);
-      if (!b && g_prevB) sw_push_button(SDL_BUTTON_RIGHT, 0);
-      g_prevA = a; g_prevB = b;
-      /* #2 滚轮：L1=上滚 R1=下滚（边沿触发） */
-      int l1 = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_LEFTSHOULDER);
-      int r1 = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_RIGHTSHOULDER);
-      if (l1 && !g_prevL1) sw_push_wheel(1);
-      if (r1 && !g_prevR1) sw_push_wheel(-1);
-      g_prevL1 = l1; g_prevR1 = r1;
+      if (start && !prev_start && !back)
+        sw_psv_system_menu();
+      prev_start = start;
     }
     SDL_Delay(16);
   }
@@ -328,10 +561,24 @@ static void sw_hook_game_func(const char *game_sym, const char *shim_sym) {
 /* 步骤 1：设备侧 SDL2 窗口初始化。
  * egl_shim 自动选后端（fbdev/kmsdrm/wayland），绝不设 SDL_VIDEODRIVER（项目铁律）。 */
 static void setup_device_sdl_video(void) {
-  if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_JOYSTICK | SDL_INIT_GAMECONTROLLER) != 0)
-    fatal_error("device SDL_Init(VIDEO|JOYSTICK|GAMECONTROLLER) failed: %s", SDL_GetError());
+  if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_JOYSTICK |
+               SDL_INIT_GAMECONTROLLER) != 0)
+    fatal_error("device SDL_Init(VIDEO|AUDIO|JOYSTICK|GAMECONTROLLER) failed: %s",
+                SDL_GetError());
+  SDL_JoystickEventState(SDL_ENABLE);
+  SDL_GameControllerEventState(SDL_ENABLE);
   egl_shim_create_window();
-  debugPrintf("Screen: %dx%d (via device SDL2)\n", egl_shim_screen_w, egl_shim_screen_h);
+  {
+    SDL_Window *w = egl_shim_get_window();
+    if (w) {
+      SDL_ShowWindow(w);
+      SDL_RaiseWindow(w);
+      SDL_SetWindowInputFocus(w);
+    }
+  }
+  debugPrintf("Screen: %dx%d (via device SDL2) audio=%s\n",
+              egl_shim_screen_w, egl_shim_screen_h,
+              SDL_GetCurrentAudioDriver() ? SDL_GetCurrentAudioDriver() : "?");
 }
 
 /* 步骤 2a：把游戏自带的 secondary .so 以 RTLD_GLOBAL 预载入全局符号域，
@@ -351,24 +598,39 @@ static void load_secondary_libs(const char *basedir) {
   for (int i = 0; SECONDARY_SOS[i]; i++) {
     const char *name = SECONDARY_SOS[i];
     char path[1536];
-    /* 先试同目录的绝对路径，再试裸名（靠 LD_LIBRARY_PATH） */
-    snprintf(path, sizeof(path), "%s/%s", basedir, name);
-    void *h = dlopen(path, RTLD_NOW | RTLD_GLOBAL);
-    if (!h) {
-      h = dlopen(name, RTLD_NOW | RTLD_GLOBAL);
+    void *h = NULL;
+    /* Android 版 libSDL2.so 在本机缺 OpenSLES/android，且要 glFramebufferTexture2DOES，
+     * E5Plus 上 dlopen 必失败；失败还会按 soname 污染后续设备版回退。
+     * 核心 SDL2 固定走设备带版本 soname（与启动脚本 /tmp/sword3libs 软链一致）。 */
+    if (strcmp(name, "libSDL2.so") == 0) {
+      h = dlopen("/usr/lib/libSDL2-2.0.so.0", RTLD_NOW | RTLD_GLOBAL);
+      if (!h)
+        h = dlopen("libSDL2.so", RTLD_NOW | RTLD_GLOBAL);
+      if (h)
+        debugPrintf("  loaded secondary: libSDL2.so (device)\n");
+    } else {
+      snprintf(path, sizeof(path), "%s/%s", basedir, name);
+      h = dlopen(path, RTLD_NOW | RTLD_GLOBAL);
+      if (!h) {
+        /* Android 版常因 LIBC 版本失败，且会污染裸 soname。改走设备带版本路径。 */
+        const char *alt = NULL;
+        if (strcmp(name, "libSDL2_image.so") == 0)
+          alt = "/usr/lib/libSDL2_image-2.0.so.0";
+        else if (strcmp(name, "libSDL2_mixer.so") == 0)
+          alt = "/usr/lib/libSDL2_mixer-2.0.so.0";
+        else if (strcmp(name, "libSDL2_ttf.so") == 0)
+          alt = "/usr/lib/libSDL2_ttf-2.0.so.0";
+        if (alt)
+          h = dlopen(alt, RTLD_NOW | RTLD_GLOBAL);
+        if (!h)
+          h = dlopen(name, RTLD_NOW | RTLD_GLOBAL);
+      }
+      if (h)
+        debugPrintf("  loaded secondary: %s\n", name);
     }
-    if (!h) {
+    if (!h)
       debugPrintf("  [warn] dlopen %s falhou: %s (非致命，若启动报缺符号再排查)\n",
                   name, dlerror());
-    } else {
-      debugPrintf("  loaded secondary: %s\n", name);
-      /* 高亮审计日志：确认 Bug A 修复生效——确实加载了随包 Android 版
-       * libSDL2_image.so（而非设备 libSDL2_image-2.0.so.0），且部署期 LIBC->WEAK
-       * 已就绪（否则上面 dlopen 已失败）。 */
-      if (strcmp(name, "libSDL2_image.so") == 0) {
-        debugPrintf("  [ok] SDL2_image = bundled libSDL2_image.so (LIBC->WEAK patched at deploy)\n");
-      }
-    }
   }
 }
 
@@ -388,16 +650,14 @@ int main(int argc, char *argv[]) {
   sw_cpu_performance();
   debugPrintf("=== 仙剑奇侠传三 (Sword3) ARM64 so-loader (NextOS) ===\n");
   /* 启动横幅加策略标识：随包 SDL2_image + 部署期 LIBC->WEAK（便于现场日志核对）。 */
-  debugPrintf("[build] %s %s (8-hook) (bundled SDL2_image + LIBC->WEAK)\n", __DATE__, __TIME__);
+  debugPrintf("[build] %s %s (PSV: B=BACK_KEY_CLICK Start=System*)\n",
+              __DATE__, __TIME__);
 
   /* 1) 设备侧 SDL2 初始化窗口：egl_shim 自动选后端（fbdev/kmsdrm/wayland），
    *    不给设备 SDL2 设 SDL_VIDEODRIVER（铁律）。 */
   setup_device_sdl_video();
 
-  /* #3 + #2：启动二进制内后台输入线程（退出热键 + 鼠标模拟，单一线程避免并发
-   * SDL_GameControllerUpdate）。仙剑以鼠标操作为主、自身不轮询手柄，故用后台线程
-   * 读物理手柄：SELECT+START 即 _exit(0)；同时把手柄映射为鼠标事件注入事件队列，
-   * 让无鼠标的掌机也能操控。不依赖 gptokeyb / 外部 kill。 */
+  /* 后台线程只做 SELECT+START 退出。手柄事件交给 2023 版 libSWD3E.so。 */
   {
     pthread_t tid;
     if (pthread_create(&tid, NULL, sw_input_thread, NULL) == 0)
@@ -416,8 +676,8 @@ int main(int argc, char *argv[]) {
   char basedir[1024];
   sw_dir(basedir, sizeof(basedir), argv[0]);
   debugPrintf("Loader dir: %s\n", basedir);
-  load_secondary_libs(basedir);
   load_device_gles();
+  load_secondary_libs(basedir);
 
   /* 3) 载入主模块 libSWD3E.so */
   size_t heap_size = (size_t)HEAP_MB * 1024 * 1024;
@@ -452,6 +712,37 @@ int main(int argc, char *argv[]) {
   sw_hook_game_func("_Z12GetInterPathPc",       "GetInterPath");
   sw_hook_game_func("_Z15GetGAMESAVEPathPc",    "GetGAMESAVEPath");
   sw_hook_game_func("_ZN6fileIO15GetResourcePathEPKc", "fileIO_GetResourcePath");
+  /* RoleDataBase / PathDataBase / StoryDataBase：OpenDataFiles() 走 GetACTPath
+   * （maps.dat / path.dat / talk1.dat），不是 GetResourcePath。原函数拼
+   * $GAMEDIR/<name>，找不到再走 JNI APKX；JNI 全空 → 返回空路径 → fopen("")
+   * → "RoleDataBase init Failed." → SIGSEGV。 */
+  sw_hook_game_func("_ZN6fileIO10GetACTPathEPKc", "fileIO_GetACTPath");
+  sw_hook_game_func("_Z22GetAndroidFileIsExistsPKc", "GetAndroidFileIsExists");
+  sw_hook_game_func("_Z20Android_APKX_SetFilePKcS0_", "Android_APKX_SetFile");
+  sw_hook_game_func("_Z14GetAPKXFileLenv", "GetAPKXFileLenv");
+  sw_hook_game_func("_Z17GetAPKXFileOffsetv", "GetAPKXFileOffsetv");
+  sw_hook_commbutton_draw();
+  sw_hook_uigamepad();
+  sw_hook_sysmenu();
+
+  /* 2023 SDL_SS2D::Init 结尾用 tpidr+0x28 做 canary。glibc 上该槽会被 Mali/PNG
+   * 改掉 → 误走 "Couldn't create window" 并和第二次 canary 检查死循环刷屏。
+   * 把两处条件跳转改成成功返回，不换 Android SDL2。 */
+  {
+    uintptr_t init = so_find_addr_safe("_ZN8SDL_SS2D4InitEPKcj");
+    if (init) {
+      uint32_t *eq = (uint32_t *)(init + 0x15b8); /* 89fa4: b.eq success */
+      uint32_t *ne = (uint32_t *)(init + 0x1608); /* 89ff4: b.ne fail-loop */
+      if (*eq == 0x540002a0u && *ne == 0x54fffda1u) {
+        *eq = 0x14000015u; /* b success */
+        *ne = 0xd503201fu; /* nop */
+        debugPrintf("[patch] SDL_SS2D::Init skip false stack_chk\n");
+      } else {
+        debugPrintf("[patch] SDL_SS2D::Init canary site mismatch %08x %08x\n",
+                    *eq, *ne);
+      }
+    }
+  }
 
   so_finalize();
   so_flush_caches();
@@ -485,6 +776,9 @@ int main(int argc, char *argv[]) {
   if (p_nativeSetupJNI) p_nativeSetupJNI(fake_env, cls);
 
   debugPrintf("SDL_main ...\n");
+  /* Init 入口前钉死 bionic canary。2023 SO 的 SDL_SS2D::Init 结尾会校验
+   * tpidr+0x28；Mali/PNG 会改掉这个槽，误走 "Couldn't create window" 分支刷屏。 */
+  egl_shim_tls_pin();
   char *main_argv[] = {"sword3", NULL};
   int rc = p_SDL_main(1, main_argv);
   debugPrintf("SDL_main returned %d\n", rc);

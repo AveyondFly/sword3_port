@@ -48,8 +48,11 @@
 #include <sched.h>
 #include <syslog.h>
 #include <sys/types.h>
+#include <sys/stat.h>
 #include <pthread.h>
 #include <math.h>
+#include <setjmp.h>
+#include <signal.h>
 
 /* These libc-internal symbols are not always declared by the headers; declare them
  * explicitly with glibc's real signatures to avoid implicit-declaration errors and
@@ -393,3 +396,58 @@ int shim_strerror_r(int errnum, char *buf, size_t buflen) {
     return 0;
 }
 __asm__(".symver shim_strerror_r, strerror_r@LIBC");
+
+/* ---- extra X@LIBC for Android SDL2_image / mixer / ttf ----
+ * 这三份库比 libc++_shared 多要 longjmp/strncpy/fopen 等。不提供则
+ * dlopen 报 "undefined symbol: longjmp, version LIBC"。fopen 等已有
+ * unversioned interpose，这里只加 @LIBC 别名，不进 version script。 */
+FILE *shim_fopen(const char *path, const char *mode) { return fopen(path, mode); }
+__asm__(".symver shim_fopen, fopen@LIBC");
+int shim_fclose(FILE *fp) { return fclose(fp); }
+__asm__(".symver shim_fclose, fclose@LIBC");
+size_t shim_fread(void *ptr, size_t size, size_t nmemb, FILE *fp) {
+    return fread(ptr, size, nmemb, fp);
+}
+__asm__(".symver shim_fread, fread@LIBC");
+int shim_fseek(FILE *fp, long off, int whence) { return fseek(fp, off, whence); }
+__asm__(".symver shim_fseek, fseek@LIBC");
+int shim_fseeko(FILE *fp, off_t off, int whence) { return fseeko(fp, off, whence); }
+__asm__(".symver shim_fseeko, fseeko@LIBC");
+long shim_ftell(FILE *fp) { return ftell(fp); }
+__asm__(".symver shim_ftell, ftell@LIBC");
+off_t shim_ftello(FILE *fp) { return ftello(fp); }
+__asm__(".symver shim_ftello, ftello@LIBC");
+int shim_ferror(FILE *fp) { return ferror(fp); }
+__asm__(".symver shim_ferror, ferror@LIBC");
+int shim_feof(FILE *fp) { return feof(fp); }
+__asm__(".symver shim_feof, feof@LIBC");
+int shim_fileno(FILE *fp) { return fileno(fp); }
+__asm__(".symver shim_fileno, fileno@LIBC");
+
+int shim_setjmp(jmp_buf env) { return _setjmp(env); }
+__asm__(".symver shim_setjmp, setjmp@LIBC");
+void shim_longjmp(jmp_buf env, int val) { longjmp(env, val); }
+__asm__(".symver shim_longjmp, longjmp@LIBC");
+
+LIBC_FWD(double, atof, (const char *nptr), (nptr))
+LIBC_FWD(double, frexp, (double x, int *exp), (x, exp))
+LIBC_FWD(double, modf, (double x, double *iptr), (x, iptr))
+LIBC_FWD(double, log, (double x), (x))
+LIBC_FWD(long, lround, (double x), (x))
+LIBC_FWD(char *, strncpy, (char *dest, const char *src, size_t n), (dest, src, n))
+LIBC_FWD(char *, strcpy, (char *dest, const char *src), (dest, src))
+LIBC_FWD(char *, strcat, (char *dest, const char *src), (dest, src))
+LIBC_FWD(int, strncmp, (const char *s1, const char *s2, size_t n), (s1, s2, n))
+LIBC_FWD(char *, strstr, (const char *hay, const char *needle), (hay, needle))
+LIBC_FWD(char *, strrchr, (const char *s, int c), (s, c))
+LIBC_FWD(char *, strtok_r, (char *str, const char *delim, char **save),
+         (str, delim, save))
+LIBC_FWD(char *, getenv, (const char *name), (name))
+LIBC_FWD(int, remove, (const char *path), (path))
+LIBC_FWD(int, unlink, (const char *path), (path))
+LIBC_FWD0(pid_t, getpid)
+LIBC_FWD(struct tm *, gmtime, (const time_t *t), (t))
+LIBC_FWD(void, qsort, (void *base, size_t nmemb, size_t size,
+         int (*cmp)(const void *, const void *)), (base, nmemb, size, cmp))
+LIBC_FWD(int, fstat, (int fd, struct stat *st), (fd, st))
+LIBC_FWD(int, sigemptyset, (sigset_t *set), (set))

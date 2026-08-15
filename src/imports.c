@@ -64,6 +64,24 @@ typedef struct _TTF_Font TTF_Font;
 extern SDL_Surface *TTF_RenderUTF8_Blended(TTF_Font *, const char *, SDL_Color);
 extern SDL_Surface *TTF_RenderUTF8_Solid(TTF_Font *, const char *, SDL_Color);
 extern SDL_Surface *TTF_RenderUTF8_Shaded(TTF_Font *, const char *, SDL_Color, SDL_Color);
+extern SDL_Surface *IMG_LoadPNG_RW(SDL_RWops *, int);
+typedef struct _Mix_Music Mix_Music;
+extern Mix_Music *Mix_LoadMUS(const char *);
+extern Mix_Music *Mix_LoadMUS_RW(SDL_RWops *, int);
+typedef struct Mix_Chunk Mix_Chunk;
+extern Mix_Chunk *Mix_LoadWAV_RW(SDL_RWops *, int);
+extern int Mix_OpenAudio(int, Uint16, int, int);
+extern int sw_SDL_PollEvent(SDL_Event *);
+static Uint32 sw_SDL_GetTicks(void) {
+  Uint32 t = SDL_GetTicks();
+  egl_shim_tls_restore();
+  return t;
+}
+static const char *sw_SDL_GetError(void) {
+  const char *e = SDL_GetError();
+  egl_shim_tls_restore();
+  return e;
+}
 
 #ifndef GL_ETC1_RGB8_OES
 #define GL_ETC1_RGB8_OES 0x8D64
@@ -335,9 +353,29 @@ static void wrap_glClear(GLbitfield mask) {
   glClear(mask);
 }
 
+extern int egl_shim_screen_w, egl_shim_screen_h;
+extern int egl_shim_win_w, egl_shim_win_h;
+
+static int viewport_looks_logical(GLsizei width, GLsizei height) {
+  return egl_shim_screen_w > 0 && egl_shim_win_w > 0 &&
+         (egl_shim_win_w != egl_shim_screen_w || egl_shim_win_h != egl_shim_screen_h) &&
+         width > 0 && height > 0 &&
+         width <= egl_shim_screen_w && height <= egl_shim_screen_h;
+}
+
 static void wrap_glViewport(GLint x, GLint y, GLsizei width, GLsizei height) {
   dbg_gl_viewport_count++;
-  glViewport(x, y, width, height);
+  int mx = x, my = y, mw = width, mh = height;
+  if (viewport_looks_logical(width, height))
+    egl_shim_map_logical_viewport(&mx, &my, &mw, &mh);
+  glViewport(mx, my, mw, mh);
+}
+
+static void wrap_glScissor(GLint x, GLint y, GLsizei width, GLsizei height) {
+  int mx = x, my = y, mw = width, mh = height;
+  if (viewport_looks_logical(width, height))
+    egl_shim_map_logical_viewport(&mx, &my, &mw, &mh);
+  glScissor(mx, my, mw, mh);
 }
 
 static void wrap_glUseProgram(GLuint program) {
@@ -1401,6 +1439,7 @@ void *summertime_gl_lookup(const char *name) {
   if (strcmp(name, "glClearColor") == 0) return (void *)wrap_glClearColor;
   if (strcmp(name, "glClear") == 0) return (void *)wrap_glClear;
   if (strcmp(name, "glViewport") == 0) return (void *)wrap_glViewport;
+  if (strcmp(name, "glScissor") == 0) return (void *)wrap_glScissor;
   if (strcmp(name, "glUseProgram") == 0) return (void *)wrap_glUseProgram;
   if (strcmp(name, "glBindBuffer") == 0) return (void *)wrap_glBindBuffer;
   if (strcmp(name, "glBindFramebuffer") == 0) return (void *)wrap_glBindFramebuffer;
@@ -1543,11 +1582,15 @@ extern uintptr_t __cxa_atexit;
 extern uintptr_t __cxa_finalize;
 
 static void __stack_chk_fail_stub(void) {
+  static int n;
   uintptr_t tls = 0;
   __asm__ volatile("mrs %0, tpidr_el0" : "=r"(tls));
   uintptr_t g = tls ? *(uintptr_t *)(tls + 0x28) : 0;
-  debugPrintf("__stack_chk_fail! caller=%p tls+0x28=0x%lx text_base=%p\n",
-              __builtin_return_address(0), (unsigned long)g, text_base);
+  if (n < 3)
+    debugPrintf("__stack_chk_fail! caller=%p tls+0x28=0x%lx text_base=%p (restore)\n",
+                __builtin_return_address(0), (unsigned long)g, text_base);
+  n++;
+  egl_shim_tls_restore();
 }
 
 static int *__errno_fake(void) { return &errno; }
@@ -2074,9 +2117,10 @@ int pthread_once_fake(volatile int *once_control, void (*init_routine)(void)) {
 // Summertime/Ren'Py so-loader shims (SDL2 Android, Mali fbdev)
 // ============================================================================
 
-// Screen geometry, set by main() before the engine runs.
-int g_summertime_screen_w = 1280;
-int g_summertime_screen_h = 720;
+// Screen geometry: logical size reported to the game (native 640x480).
+/* 由 egl_shim_create_window 写成逻辑分辨率，禁止当编译期常量 / 设备分辨率用。 */
+int g_summertime_screen_w = 0;
+int g_summertime_screen_h = 0;
 
 // Mali fbdev native window: EGL/fbdev_window.h => { unsigned short w,h }.
 typedef struct {
@@ -2236,6 +2280,37 @@ static void *my_dlsym(void *handle, const char *name) {
     if (!strcmp(name, "TTF_RenderUTF8_Blended")) return (void *)&TTF_RenderUTF8_Blended;
     if (!strcmp(name, "TTF_RenderUTF8_Solid"))   return (void *)&TTF_RenderUTF8_Solid;
     if (!strcmp(name, "TTF_RenderUTF8_Shaded"))  return (void *)&TTF_RenderUTF8_Shaded;
+    if (!strcmp(name, "SDL_CreateWindow"))  return (void *)&egl_shim_SDL_CreateWindow;
+    if (!strcmp(name, "SDL_DestroyWindow")) return (void *)&egl_shim_SDL_DestroyWindow;
+    if (!strcmp(name, "SDL_Quit")) return (void *)&egl_shim_SDL_Quit;
+    if (!strcmp(name, "SDL_Init")) return (void *)&egl_shim_SDL_Init;
+    if (!strcmp(name, "SDL_GetWindowSize")) return (void *)&egl_shim_SDL_GetWindowSize;
+    if (!strcmp(name, "SDL_SetWindowFullscreen"))
+      return (void *)&egl_shim_SDL_SetWindowFullscreen;
+    if (!strcmp(name, "SDL_SetWindowDisplayMode"))
+      return (void *)&egl_shim_SDL_SetWindowDisplayMode;
+    if (!strcmp(name, "SDL_GetCurrentDisplayMode"))
+      return (void *)&egl_shim_SDL_GetCurrentDisplayMode;
+    if (!strcmp(name, "SDL_GetDesktopDisplayMode"))
+      return (void *)&egl_shim_SDL_GetDesktopDisplayMode;
+    if (!strcmp(name, "SDL_GetDisplayMode"))
+      return (void *)&egl_shim_SDL_GetDisplayMode;
+    if (!strcmp(name, "SDL_GetDisplayBounds"))
+      return (void *)&egl_shim_SDL_GetDisplayBounds;
+    if (!strcmp(name, "SDL_CreateRenderer"))
+      return (void *)&egl_shim_SDL_CreateRenderer;
+    if (!strcmp(name, "SDL_RenderSetLogicalSize"))
+      return (void *)&egl_shim_SDL_RenderSetLogicalSize;
+    if (!strcmp(name, "SDL_VideoInit")) return (void *)&egl_shim_SDL_VideoInit;
+    if (!strcmp(name, "SDL_AudioInit")) return (void *)&egl_shim_SDL_AudioInit;
+    if (!strcmp(name, "SDL_AudioQuit")) return (void *)&egl_shim_SDL_AudioQuit;
+    if (!strcmp(name, "SDL_PollEvent")) return (void *)&sw_SDL_PollEvent;
+    if (!strcmp(name, "SDL_GetTicks")) return (void *)&sw_SDL_GetTicks;
+    if (!strcmp(name, "SDL_GetError")) return (void *)&sw_SDL_GetError;
+    if (!strcmp(name, "Mix_LoadMUS")) return (void *)&Mix_LoadMUS;
+    if (!strcmp(name, "Mix_LoadMUS_RW")) return (void *)&Mix_LoadMUS_RW;
+    if (!strcmp(name, "Mix_LoadWAV_RW")) return (void *)&Mix_LoadWAV_RW;
+    if (!strcmp(name, "Mix_OpenAudio")) return (void *)&Mix_OpenAudio;
   }
   return dlsym(handle, name);
 }
@@ -2466,6 +2541,100 @@ static int ALooper_pollOnce_fake(int timeout_ms, int *out_fd, int *out_events,
     *out_data = NULL;
   return -3; // ALOOPER_POLL_TIMEOUT
 }
+static int ALooper_addFd_fake(void *looper, int fd, int ident, int events,
+                              void *cb, void *data) {
+  (void)looper;
+  (void)fd;
+  (void)ident;
+  (void)events;
+  (void)cb;
+  (void)data;
+  return 0;
+}
+static void AInputQueue_attachLooper_fake(void *q, void *looper, int ident,
+                                          void *cb, void *data) {
+  (void)q;
+  (void)looper;
+  (void)ident;
+  (void)cb;
+  (void)data;
+}
+static void AInputQueue_detachLooper_fake(void *q) { (void)q; }
+static int AInputQueue_getEvent_fake(void *q, void **out) {
+  (void)q;
+  if (out)
+    *out = NULL;
+  return -1;
+}
+static int AInputQueue_preDispatchEvent_fake(void *q, void *e) {
+  (void)q;
+  (void)e;
+  return 0;
+}
+static void AInputQueue_finishEvent_fake(void *q, void *e, int handled) {
+  (void)q;
+  (void)e;
+  (void)handled;
+}
+static int AssetPackManager_init_fake(void *vm, void *ctx) {
+  (void)vm;
+  (void)ctx;
+  return -1;
+}
+static void AssetPackManager_destroy_fake(void) {}
+static int AssetPackManager_requestInfo_fake(void *a, void *b) {
+  (void)a;
+  (void)b;
+  return -1;
+}
+static int AssetPackManager_requestDownload_fake(void *a, void *b) {
+  (void)a;
+  (void)b;
+  return -1;
+}
+static int AssetPackManager_getDownloadState_fake(void *a, void *b, void *c) {
+  (void)a;
+  (void)b;
+  (void)c;
+  return -1;
+}
+static int AssetPackManager_getAssetPackLocation_fake(void *a, void *b) {
+  (void)a;
+  (void)b;
+  return -1;
+}
+static void AssetPackManager_onPause_fake(void) {}
+static void AssetPackManager_onResume_fake(void) {}
+static int AssetPackManager_showCellularDataConfirmation_fake(void *a) {
+  (void)a;
+  return -1;
+}
+static int AssetPackManager_getShowCellularDataConfirmationStatus_fake(void *a) {
+  (void)a;
+  return -1;
+}
+static void AssetPackDownloadState_destroy_fake(void *s) { (void)s; }
+static long AssetPackDownloadState_getBytesDownloaded_fake(void *s) {
+  (void)s;
+  return 0;
+}
+static int AssetPackDownloadState_getStatus_fake(void *s) {
+  (void)s;
+  return 0;
+}
+static long AssetPackDownloadState_getTotalBytesToDownload_fake(void *s) {
+  (void)s;
+  return 0;
+}
+static void AssetPackLocation_destroy_fake(void *s) { (void)s; }
+static const char *AssetPackLocation_getAssetsPath_fake(void *s) {
+  (void)s;
+  return NULL;
+}
+static int AssetPackLocation_getStorageMethod_fake(void *s) {
+  (void)s;
+  return 0;
+}
 static void *ASensorManager_getInstance_fake(void) {
   static int mgr;
   return &mgr;
@@ -2618,6 +2787,30 @@ DynLibFunction dynlib_functions[] = {
     {"TTF_RenderUTF8_Blended", (uintptr_t)&TTF_RenderUTF8_Blended},
     {"TTF_RenderUTF8_Solid", (uintptr_t)&TTF_RenderUTF8_Solid},
     {"TTF_RenderUTF8_Shaded", (uintptr_t)&TTF_RenderUTF8_Shaded},
+    {"SDL_CreateWindow", (uintptr_t)&egl_shim_SDL_CreateWindow},
+    {"SDL_DestroyWindow", (uintptr_t)&egl_shim_SDL_DestroyWindow},
+    {"SDL_Quit", (uintptr_t)&egl_shim_SDL_Quit},
+    {"SDL_Init", (uintptr_t)&egl_shim_SDL_Init},
+    {"SDL_GetWindowSize", (uintptr_t)&egl_shim_SDL_GetWindowSize},
+    {"SDL_SetWindowFullscreen", (uintptr_t)&egl_shim_SDL_SetWindowFullscreen},
+    {"SDL_SetWindowDisplayMode", (uintptr_t)&egl_shim_SDL_SetWindowDisplayMode},
+    {"SDL_GetCurrentDisplayMode", (uintptr_t)&egl_shim_SDL_GetCurrentDisplayMode},
+    {"SDL_GetDesktopDisplayMode", (uintptr_t)&egl_shim_SDL_GetDesktopDisplayMode},
+    {"SDL_GetDisplayMode", (uintptr_t)&egl_shim_SDL_GetDisplayMode},
+    {"SDL_GetDisplayBounds", (uintptr_t)&egl_shim_SDL_GetDisplayBounds},
+    {"SDL_CreateRenderer", (uintptr_t)&egl_shim_SDL_CreateRenderer},
+    {"SDL_RenderSetLogicalSize", (uintptr_t)&egl_shim_SDL_RenderSetLogicalSize},
+    {"SDL_VideoInit", (uintptr_t)&egl_shim_SDL_VideoInit},
+    {"SDL_AudioInit", (uintptr_t)&egl_shim_SDL_AudioInit},
+    {"SDL_AudioQuit", (uintptr_t)&egl_shim_SDL_AudioQuit},
+    {"SDL_PollEvent", (uintptr_t)&sw_SDL_PollEvent},
+    {"SDL_GetTicks", (uintptr_t)&sw_SDL_GetTicks},
+    {"SDL_GetError", (uintptr_t)&sw_SDL_GetError},
+    {"IMG_LoadPNG_RW", (uintptr_t)&IMG_LoadPNG_RW},
+    {"Mix_LoadMUS", (uintptr_t)&Mix_LoadMUS},
+    {"Mix_LoadMUS_RW", (uintptr_t)&Mix_LoadMUS_RW},
+    {"Mix_LoadWAV_RW", (uintptr_t)&Mix_LoadWAV_RW},
+    {"Mix_OpenAudio", (uintptr_t)&Mix_OpenAudio},
     {"__errno", (uintptr_t)&__errno_fake},
     {"__get_h_errno", (uintptr_t)&__get_h_errno_fake},
     {"_exit", (uintptr_t)&_exit},
@@ -2737,7 +2930,7 @@ DynLibFunction dynlib_functions[] = {
     {"glPixelStorei", (uintptr_t)&wrap_glPixelStorei},
     {"glReadPixels", (uintptr_t)&glReadPixels},
     {"glRenderbufferStorage", (uintptr_t)&glRenderbufferStorage},
-    {"glScissor", (uintptr_t)&glScissor},
+    {"glScissor", (uintptr_t)&wrap_glScissor},
     {"glShaderBinary", (uintptr_t)&glShaderBinary},
     {"glShaderSource", (uintptr_t)&glShaderSource},
     {"glStencilFunc", (uintptr_t)&glStencilFunc},
@@ -3026,6 +3219,29 @@ DynLibFunction dynlib_functions[] = {
     {"ALooper_prepare", (uintptr_t)&ALooper_prepare_fake},
     {"ALooper_forThread", (uintptr_t)&ALooper_forThread_fake},
     {"ALooper_pollOnce", (uintptr_t)&ALooper_pollOnce_fake},
+    {"ALooper_addFd", (uintptr_t)&ALooper_addFd_fake},
+    {"AInputQueue_attachLooper", (uintptr_t)&AInputQueue_attachLooper_fake},
+    {"AInputQueue_detachLooper", (uintptr_t)&AInputQueue_detachLooper_fake},
+    {"AInputQueue_getEvent", (uintptr_t)&AInputQueue_getEvent_fake},
+    {"AInputQueue_preDispatchEvent", (uintptr_t)&AInputQueue_preDispatchEvent_fake},
+    {"AInputQueue_finishEvent", (uintptr_t)&AInputQueue_finishEvent_fake},
+    {"AssetPackManager_init", (uintptr_t)&AssetPackManager_init_fake},
+    {"AssetPackManager_destroy", (uintptr_t)&AssetPackManager_destroy_fake},
+    {"AssetPackManager_requestInfo", (uintptr_t)&AssetPackManager_requestInfo_fake},
+    {"AssetPackManager_requestDownload", (uintptr_t)&AssetPackManager_requestDownload_fake},
+    {"AssetPackManager_getDownloadState", (uintptr_t)&AssetPackManager_getDownloadState_fake},
+    {"AssetPackManager_getAssetPackLocation", (uintptr_t)&AssetPackManager_getAssetPackLocation_fake},
+    {"AssetPackManager_onPause", (uintptr_t)&AssetPackManager_onPause_fake},
+    {"AssetPackManager_onResume", (uintptr_t)&AssetPackManager_onResume_fake},
+    {"AssetPackManager_showCellularDataConfirmation", (uintptr_t)&AssetPackManager_showCellularDataConfirmation_fake},
+    {"AssetPackManager_getShowCellularDataConfirmationStatus", (uintptr_t)&AssetPackManager_getShowCellularDataConfirmationStatus_fake},
+    {"AssetPackDownloadState_destroy", (uintptr_t)&AssetPackDownloadState_destroy_fake},
+    {"AssetPackDownloadState_getBytesDownloaded", (uintptr_t)&AssetPackDownloadState_getBytesDownloaded_fake},
+    {"AssetPackDownloadState_getStatus", (uintptr_t)&AssetPackDownloadState_getStatus_fake},
+    {"AssetPackDownloadState_getTotalBytesToDownload", (uintptr_t)&AssetPackDownloadState_getTotalBytesToDownload_fake},
+    {"AssetPackLocation_destroy", (uintptr_t)&AssetPackLocation_destroy_fake},
+    {"AssetPackLocation_getAssetsPath", (uintptr_t)&AssetPackLocation_getAssetsPath_fake},
+    {"AssetPackLocation_getStorageMethod", (uintptr_t)&AssetPackLocation_getStorageMethod_fake},
     {"ASensorManager_getInstance", (uintptr_t)&ASensorManager_getInstance_fake},
     {"ASensorManager_getSensorList",
      (uintptr_t)&ASensorManager_getSensorList_fake},

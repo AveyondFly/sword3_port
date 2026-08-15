@@ -151,6 +151,30 @@ LIBC {
     /* 数学（libm） */
     exp2;
     pow;
+    atof;
+    frexp;
+    modf;
+    log;
+    lround;
+
+    /* Android SDL2_image / mixer / ttf 额外 LIBC */
+    setjmp;
+    longjmp;
+    strncpy;
+    strcpy;
+    strcat;
+    strncmp;
+    strstr;
+    strrchr;
+    strtok_r;
+    getenv;
+    remove;
+    unlink;
+    getpid;
+    gmtime;
+    qsort;
+    fstat;
+    sigemptyset;
 
     /* pthread（libpthread） */
     pthread_cond_broadcast;
