@@ -1,0 +1,179 @@
+/* libbionic_shim.vers — libbionic_shim.so 的版本脚本。
+ *
+ * 声明 "LIBC" 版本节点并导出全部 X@LIBC 符号（转发到 glibc/libpthread/libm 真身），
+ * 使随包 Android .so（libc++_shared / libsmpeg2 / libhidapi）经 glibc dlopen 时能在
+ * 全局符号域（libbionic_shim.so 以 RTLD_GLOBAL 预载）命中这些 X@LIBC，规避本设备
+ * glibc 不 honor WEAK 版本回退导致的 "undefined symbol: free, version LIBC"。
+ *
+ * 注意：仅在此声明 LIBC 版本节点；未列入任何版本节点的其它全局符号（Android_JNI_*、
+ * fopen/open/fread/SDL_RWFromFile/IMG_Load/IMG_LoadPNG_RW/SMPEG_* 等）保持默认（无版本）
+ * 导出，行为不变。未使用 "local: *;"，故不会误隐藏既有导出。
+ */
+LIBC {
+  global:
+    /* bionic 内部 / 运行时 */
+    __sF;
+    __errno;
+    __cxa_atexit;
+    __cxa_finalize;
+    __stack_chk_fail;
+    __ctype_get_mb_cur_max;
+    android_set_abort_message;
+    dl_iterate_phdr;
+
+    /* 内存 / 分配 */
+    calloc;
+    free;
+    malloc;
+    posix_memalign;
+    realloc;
+
+    /* 字符串（非宽字符） */
+    memchr;
+    memcmp;
+    memcpy;
+    memmove;
+    memset;
+    strcmp;
+    strcoll;
+    strerror;
+    strerror_r;
+    strdup;
+    strxfrm;
+    strlen;
+
+    /* 宽字符 */
+    btowc;
+    mbrlen;
+    mbrtowc;
+    mbsnrtowcs;
+    mbsrtowcs;
+    mbtowc;
+    wcrtomb;
+    wcscoll;
+    wcslen;
+    wcsncpy;
+    wcsnrtombs;
+    wcsxfrm;
+    wctob;
+    wmemchr;
+    wmemcmp;
+    wmemcpy;
+    wmemmove;
+    wmemset;
+
+    /* ctype / locale */
+    islower;
+    isupper;
+    isxdigit;
+    iswalpha;
+    iswblank;
+    iswcntrl;
+    iswdigit;
+    iswlower;
+    iswprint;
+    iswpunct;
+    iswspace;
+    iswupper;
+    iswxdigit;
+    tolower;
+    toupper;
+    towlower;
+    towupper;
+    freelocale;
+    localeconv;
+    newlocale;
+    setlocale;
+    uselocale;
+    strftime;
+
+    /* 标准 IO
+     * 注：fopen 是 libbionic_shim.c 里已有的 unversioned 全局 interpose，且【不在】
+     * 三个 .so 的 LIBC 依赖清单内，故这里【不】列入 LIBC 节点，保持 unversioned。
+     * open 同样为既有 interpose，在 libbionic_shim.c 里【保持 unversioned】，供游戏库的
+     * unversioned open 调用（其内部 dlsym(RTLD_NEXT,"open") 转发到 glibc 真 open，无递归）。
+     * libc++_shared 所需的 open@LIBC 由 src/libc_compat_shim.c 里的 shim_open 单独提供
+     * （.symver shim_open, open@LIBC，转发到 glibc 真 open64）。open【不】列入本 LIBC 节点，
+     * 否则版本脚本会生成 open@LIBC，与 shim_open 的 open@LIBC 同名重复，链接报
+     * "multiple definition of open"。open 的全局可见性由 interpose（unversioned）保证。 */
+    fdopen;
+    fflush;
+    fprintf;
+    fputc;
+    fwrite;
+    getc;
+    openlog;
+    closelog;
+    perror;
+    printf;
+    puts;
+    snprintf;
+    sprintf;
+    sscanf;
+    swprintf;
+    syslog;
+    ungetc;
+    vasprintf;
+    vfprintf;
+    vsnprintf;
+    vsprintf;
+    vsscanf;
+
+    /* 时间 / OS */
+    clock_gettime;
+    nanosleep;
+    read;
+    close;
+    sched_yield;
+    sysconf;
+
+    /* stdlib / 数值转换 */
+    abort;
+    exit;
+    strtod;
+    strtof;
+    strtol;
+    strtold;
+    strtold_l;
+    strtoll;
+    strtoll_l;
+    strtoul;
+    strtoull;
+    strtoull_l;
+    wcstod;
+    wcstof;
+    wcstol;
+    wcstold;
+    wcstoll;
+    wcstoul;
+    wcstoull;
+
+    /* 数学（libm） */
+    exp2;
+    pow;
+
+    /* pthread（libpthread） */
+    pthread_cond_broadcast;
+    pthread_cond_destroy;
+    pthread_cond_signal;
+    pthread_cond_timedwait;
+    pthread_cond_wait;
+    pthread_create;
+    pthread_detach;
+    pthread_equal;
+    pthread_getspecific;
+    pthread_join;
+    pthread_key_create;
+    pthread_key_delete;
+    pthread_mutex_destroy;
+    pthread_mutex_init;
+    pthread_mutex_lock;
+    pthread_mutex_trylock;
+    pthread_mutex_unlock;
+    pthread_mutexattr_destroy;
+    pthread_mutexattr_init;
+    pthread_mutexattr_settype;
+    pthread_once;
+    pthread_self;
+    pthread_setspecific;
+};

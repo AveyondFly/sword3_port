@@ -1,0 +1,5 @@
+sword3:            ELF 64-bit LSB shared object, ARM aarch64, version 1 (SYSV), dynamically linked, interpreter /lib/ld-linux-aarch64.so.1, BuildID[sha1]=ec9ee9261e519dc41e544463d2bd16f8221bdb05, for GNU/Linux 3.7.0, stripped
+libbionic_shim.so: ELF 64-bit LSB shared object, ARM aarch64, version 1 (SYSV), dynamically linked, BuildID[sha1]=d99734176809b3d4aeb23e1aaff3100c7fe6f718, stripped
+liblog.so:         ELF 64-bit LSB shared object, ARM aarch64, version 1 (SYSV), dynamically linked, BuildID[sha1]=9f54e68bad16db8fc1872afe8487375d40ab3fe0, stripped
+-rwxr-xr-x 1 root root  64728 Aug  1 05:53 libbionic_shim.so
+-rwxr-xr-x 1 root root 222680 Aug  1 05:53 sword3

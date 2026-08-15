@@ -1,0 +1,15 @@
+# 构建产物（二进制，不入库，仅提交源码）
+sword3
+libbionic_shim.so
+liblog.so
+build/
+deploy/
+
+# 游戏自带数据（BYO-data，不入库）
+*.so
+assets/
+
+# 设备运行日志（临时，不入库；手动跑游戏会存回本目录）
+log.txt
+debug.log
+*.log
