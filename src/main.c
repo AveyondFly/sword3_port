@@ -207,24 +207,30 @@ static int sw_in_fight(void);
 
 #define SW_CHEAT_MONEY_MAX 99999999
 #define SW_ROLE_STRIDE     0x34c8
-#define SW_CHEAT_N         7
+#define SW_CHEAT_N         9
 #define SW_CHEAT_MONEY     0
 #define SW_CHEAT_HP        1
 #define SW_CHEAT_NOENC     2
 #define SW_CHEAT_LVUP      3
 #define SW_CHEAT_OHKO      4
 #define SW_CHEAT_CATCH     5
-#define SW_CHEAT_CLOSE     6
+#define SW_CHEAT_REFINE    6
+#define SW_CHEAT_GHOST     7
+#define SW_CHEAT_CLOSE     8
 #define SW_MAINROLE_STRIDE 0x3c
+#define SW_GHOST_N         5
+#define SW_GHOST_TYPE_OFF  136
 
 static int g_cheat_open;
 static int g_cheat_sel;
+static int g_cheat_ghost;
 static int g_no_encounter;
 static int g_auto_level;
 static int g_lvup_applied;
 static int g_lvup_was_fight;
 static int g_one_hit;
 static int g_catch_ok;
+static int g_refine_ok;
 static char g_cheat_status[64];
 static Uint32 g_cheat_status_until;
 static TTF_Font *g_cheat_font;
@@ -233,6 +239,7 @@ static void (*CalLevel_orig)(void);
 static void (*HitDamage1_orig)(void *, void *);
 static void (*HitDamage3_orig)(void *, void *, short *, short *);
 static int (*CheckObsolt_orig)(void *, void *);
+static int (*CheckKeeperEscape_orig)(void *, unsigned short);
 
 static void *sw_sym(const char *name) {
   return (void *)so_find_addr_safe(name);
@@ -565,9 +572,15 @@ static void sw_hook_hit_damage(void) {
 }
 
 static int j_CheckObsolt(void *this, void *target) {
-  if (g_catch_ok)
+  if (g_catch_ok || g_refine_ok)
     return 1;
   return CheckObsolt_orig(this, target);
+}
+
+static int j_CheckKeeperEscape(void *this, unsigned short lv) {
+  if (g_refine_ok)
+    return 0;
+  return CheckKeeperEscape_orig(this, lv);
 }
 
 static void sw_hook_check_obsolt(void) {
@@ -582,7 +595,22 @@ static void sw_hook_check_obsolt(void) {
     return;
   }
   hook_arm64(fn, (uintptr_t)j_CheckObsolt);
-  debugPrintf("[patch] MAN_ROLE::CheckObsolt -> catch-ok toggle\n");
+  debugPrintf("[patch] MAN_ROLE::CheckObsolt -> catch/refine toggle\n");
+}
+
+static void sw_hook_keeper_escape(void) {
+  uintptr_t fn = so_find_addr_safe("_ZN8MAN_ROLE17CheckKeeperEscapeEt");
+  if (!fn) {
+    debugPrintf("[patch] CheckKeeperEscape not found\n");
+    return;
+  }
+  CheckKeeperEscape_orig = sw_make_draw_tramp(fn);
+  if (!CheckKeeperEscape_orig) {
+    debugPrintf("[patch] CheckKeeperEscape tramp mmap failed\n");
+    return;
+  }
+  hook_arm64(fn, (uintptr_t)j_CheckKeeperEscape);
+  debugPrintf("[patch] MAN_ROLE::CheckKeeperEscape -> refine toggle\n");
 }
 
 static void sw_hook_commbutton_draw(void) {
@@ -982,6 +1010,56 @@ static void sw_cheat_toggle_catch(void) {
   sw_cheat_set_status(g_catch_ok ? "抓怪必成已开" : "抓怪必成已关");
 }
 
+static void sw_cheat_toggle_refine(void) {
+  g_refine_ok = !g_refine_ok;
+  sw_cheat_set_status(g_refine_ok ? "炼妖必成已开" : "炼妖必成已关");
+}
+
+static const char *sw_ghost_name(int id) {
+  static const char *names[] = {"金符鬼", "木符鬼", "水符鬼", "火符鬼", "土符鬼"};
+
+  if (id < 0 || id >= SW_GHOST_N)
+    return "符鬼";
+  return names[id];
+}
+
+static int sw_ghost_current(void) {
+  char *g = (char *)sw_sym("gGHOST");
+  unsigned short *num = (unsigned short *)sw_sym("GhostNum");
+  int type;
+
+  if (g) {
+    type = *(int *)(g + SW_GHOST_TYPE_OFF);
+    if (type >= 0 && type < SW_GHOST_N)
+      return type;
+  }
+  if (num && *num >= 1 && *num <= SW_GHOST_N)
+    return *num - 1;
+  return g_cheat_ghost;
+}
+
+static void sw_cheat_apply_ghost(void) {
+  void (*reset)(void *, int);
+  void *g;
+  unsigned short *num;
+  char msg[32];
+
+  reset = (void (*)(void *, int))sw_sym("_ZN6cGHOST10reset_dataEi");
+  g = sw_sym("gGHOST");
+  num = (unsigned short *)sw_sym("GhostNum");
+  if (!reset || !g) {
+    sw_cheat_set_status("找不到符鬼数据");
+    return;
+  }
+  if (g_cheat_ghost < 0 || g_cheat_ghost >= SW_GHOST_N)
+    g_cheat_ghost = 0;
+  reset(g, g_cheat_ghost);
+  if (num)
+    *num = (unsigned short)(g_cheat_ghost + 1);
+  snprintf(msg, sizeof(msg), "已设置%s", sw_ghost_name(g_cheat_ghost));
+  sw_cheat_set_status(msg);
+}
+
 static void sw_cheat_apply(void) {
   if (g_cheat_sel == SW_CHEAT_MONEY)
     sw_cheat_apply_money();
@@ -995,6 +1073,10 @@ static void sw_cheat_apply(void) {
     sw_cheat_toggle_ohko();
   else if (g_cheat_sel == SW_CHEAT_CATCH)
     sw_cheat_toggle_catch();
+  else if (g_cheat_sel == SW_CHEAT_REFINE)
+    sw_cheat_toggle_refine();
+  else if (g_cheat_sel == SW_CHEAT_GHOST)
+    sw_cheat_apply_ghost();
   else
     g_cheat_open = 0;
 }
@@ -1012,6 +1094,7 @@ static int sw_handle_cheat_pad(SDL_Event *ev) {
       g_cheat_open = !g_cheat_open;
       if (g_cheat_open) {
         g_cheat_sel = 0;
+        g_cheat_ghost = sw_ghost_current();
         g_cheat_status[0] = 0;
       }
     }
@@ -1025,6 +1108,12 @@ static int sw_handle_cheat_pad(SDL_Event *ev) {
       g_cheat_sel = (g_cheat_sel + SW_CHEAT_N - 1) % SW_CHEAT_N;
     else if (btn == SDL_CONTROLLER_BUTTON_DPAD_DOWN)
       g_cheat_sel = (g_cheat_sel + 1) % SW_CHEAT_N;
+    else if (btn == SDL_CONTROLLER_BUTTON_DPAD_LEFT &&
+             g_cheat_sel == SW_CHEAT_GHOST)
+      g_cheat_ghost = (g_cheat_ghost + SW_GHOST_N - 1) % SW_GHOST_N;
+    else if (btn == SDL_CONTROLLER_BUTTON_DPAD_RIGHT &&
+             g_cheat_sel == SW_CHEAT_GHOST)
+      g_cheat_ghost = (g_cheat_ghost + 1) % SW_GHOST_N;
     else if (btn == SDL_CONTROLLER_BUTTON_A)
       sw_cheat_apply();
     else if (btn == SDL_CONTROLLER_BUTTON_B)
@@ -1097,7 +1186,7 @@ static void sw_cheat_present(void *renderer) {
   SDL_Rect dim, box, hi;
   char gold[64];
   char item[32];
-  static const char *items[] = {"金钱最大", "全员满血", NULL, NULL, NULL, NULL, "关闭"};
+  static const char *items[] = {"金钱最大", "全员满血", NULL, NULL, NULL, NULL, NULL, NULL, "关闭"};
   SDL_Color title = {255, 220, 120, 255};
   SDL_Color on = {255, 255, 210, 255};
   SDL_Color off = {210, 200, 180, 255};
@@ -1109,7 +1198,7 @@ static void sw_cheat_present(void *renderer) {
   sw = egl_shim_screen_w > 0 ? egl_shim_screen_w : SW_NATIVE_W;
   sh = egl_shim_screen_h > 0 ? egl_shim_screen_h : SW_NATIVE_H;
   pw = 360;
-  ph = 376;
+  ph = 440;
   px = (sw - pw) / 2;
   py = (sh - ph) / 2;
   SDL_GetRenderDrawBlendMode(r, &old_bm);
@@ -1157,6 +1246,14 @@ static void sw_cheat_present(void *renderer) {
       snprintf(item, sizeof(item), "抓怪必成  %s",
                g_catch_ok ? "开" : "关");
       label = item;
+    } else if (i == SW_CHEAT_REFINE) {
+      snprintf(item, sizeof(item), "炼妖必成  %s",
+               g_refine_ok ? "开" : "关");
+      label = item;
+    } else if (i == SW_CHEAT_GHOST) {
+      snprintf(item, sizeof(item), "设置符鬼  %s",
+               sw_ghost_name(g_cheat_ghost));
+      label = item;
     } else {
       label = items[i];
     }
@@ -1172,9 +1269,13 @@ static void sw_cheat_present(void *renderer) {
       sw_cheat_text(r, px + 28, iy, label, off);
     }
   }
-  sw_cheat_text(r, px + 24, py + 316, "A 确定   B/Y 关闭   上下选择", hint);
+  sw_cheat_text(r, px + 24, py + 380,
+                g_cheat_sel == SW_CHEAT_GHOST
+                    ? "A 设置   左右切换   上下选择"
+                    : "A 确定   B/Y 关闭   上下选择",
+                hint);
   if (g_cheat_status[0] && SDL_GetTicks() < g_cheat_status_until)
-    sw_cheat_text(r, px + 24, py + 342, g_cheat_status, ok);
+    sw_cheat_text(r, px + 24, py + 406, g_cheat_status, ok);
   SDL_SetRenderDrawBlendMode(r, old_bm);
   SDL_SetRenderDrawColor(r, or_, og, ob, oa);
 }
@@ -1483,6 +1584,7 @@ int main(int argc, char *argv[]) {
   sw_hook_cal_level();
   sw_hook_hit_damage();
   sw_hook_check_obsolt();
+  sw_hook_keeper_escape();
   sw_hook_uigamepad();
 
   /* 2023 SDL_SS2D::Init 结尾用 tpidr+0x28 做 canary。glibc 上该槽会被 Mali/PNG
