@@ -44,6 +44,11 @@
 #include <SDL2/SDL.h>
 
 #include "egl_shim.h"
+
+typedef struct _TTF_Font TTF_Font;
+extern TTF_Font *TTF_OpenFont(const char *file, int ptsize);
+extern SDL_Surface *TTF_RenderUTF8_Blended(TTF_Font *font, const char *text,
+                                           SDL_Color fg);
 #include "error.h"
 #include "imports.h"
 #include "jni_shim.h"
@@ -177,7 +182,8 @@ static void sw_cpu_performance(void) {
 
 /* A 确认：主指令原样交给游戏；自动/逃跑由 loader 补一层焦点后再走 IsClick。
  * B：战斗只置 BACK_KEY_CLICK；野外/菜单按住=右键按住、松开=右键松开（原始端口）。
- * X 不拦。Start 只留 SELECT+START 退出。
+ * X 不拦。Y 打开/关闭内置修改器（打开时其余按键不进游戏）。
+ * Start 只留 SELECT+START 退出。
  * 系统菜单换人：PSV 开前触摸点头像；游戏自己把 L1/R1 映成 key 25/26，
  * Console30 / *IconChg 用这两个键切 fcs_Icon。这边无触摸，只把肩键
  * 写成这两键；方向左右仍交给游戏（道具/法术列表要用来移动）。 */
@@ -196,7 +202,37 @@ static void sw_cpu_performance(void) {
 static int g_extra_sel;
 static int g_extra_click;
 static int g_extra_saved_sel = 1;
+static char g_basedir[1024];
 static int sw_in_fight(void);
+
+#define SW_CHEAT_MONEY_MAX 99999999
+#define SW_ROLE_STRIDE     0x34c8
+#define SW_CHEAT_N         7
+#define SW_CHEAT_MONEY     0
+#define SW_CHEAT_HP        1
+#define SW_CHEAT_NOENC     2
+#define SW_CHEAT_LVUP      3
+#define SW_CHEAT_OHKO      4
+#define SW_CHEAT_CATCH     5
+#define SW_CHEAT_CLOSE     6
+#define SW_MAINROLE_STRIDE 0x3c
+
+static int g_cheat_open;
+static int g_cheat_sel;
+static int g_no_encounter;
+static int g_auto_level;
+static int g_lvup_applied;
+static int g_lvup_was_fight;
+static int g_one_hit;
+static int g_catch_ok;
+static char g_cheat_status[64];
+static Uint32 g_cheat_status_until;
+static TTF_Font *g_cheat_font;
+static int (*ChanceOfBattle_orig)(int, int);
+static void (*CalLevel_orig)(void);
+static void (*HitDamage1_orig)(void *, void *);
+static void (*HitDamage3_orig)(void *, void *, short *, short *);
+static int (*CheckObsolt_orig)(void *, void *);
 
 static void *sw_sym(const char *name) {
   return (void *)so_find_addr_safe(name);
@@ -373,6 +409,180 @@ static void *sw_make_draw_tramp(uintptr_t func) {
   *(uint64_t *)(t + 6) = func + 16;
   __builtin___clear_cache((char *)p, (char *)p + 32);
   return p;
+}
+
+static int j_ChanceOfBattle(int a, int b) {
+  if (g_no_encounter)
+    return 0;
+  return ChanceOfBattle_orig(a, b);
+}
+
+static void sw_force_next_level_exp(void) {
+  int *maxn = (int *)sw_sym("MaxManNumber");
+  int *manid = (int *)sw_sym("ManId");
+  char *mainrole = (char *)sw_sym("MainRole");
+  unsigned short *maxlv = (unsigned short *)sw_sym("MAX_LEVEL");
+  char *roles = (char *)sw_sym("manrole");
+  void (*check_lv)(int, int, unsigned int *);
+  int (*check_keeper)(void *);
+  int (*check_npc)(void *);
+  int (*check_ghost)(void *);
+  int i, n;
+
+  check_lv = (void (*)(int, int, unsigned int *))sw_sym(
+      "_Z16Check_Level_DataiiPj");
+  check_keeper = (int (*)(void *))sw_sym("_ZN4ROLE11CheckKeeperEv");
+  check_npc = (int (*)(void *))sw_sym("_ZN4ROLE8CheckNpcEv");
+  check_ghost = (int (*)(void *))sw_sym("_ZN4ROLE10CheckGhostEv");
+  if (!maxn || !manid || !mainrole || !check_lv)
+    return;
+  n = *maxn;
+  if (n < 0)
+    return;
+  if (n > 16)
+    n = 16;
+  for (i = 0; i < n; i++) {
+    int idx = manid[i];
+    char *role = roles ? roles + (size_t)i * SW_ROLE_STRIDE : NULL;
+    char *rec;
+    unsigned int need = 0;
+    unsigned int *exp;
+    unsigned char lv;
+
+    if (idx < 0 || idx > 9)
+      continue;
+    if (role && check_keeper && check_keeper(role))
+      continue;
+    if (role && check_npc && check_npc(role))
+      continue;
+    if (role && check_ghost && check_ghost(role))
+      continue;
+    rec = mainrole + (size_t)idx * SW_MAINROLE_STRIDE;
+    lv = (unsigned char)rec[44];
+    if (maxlv && lv >= *maxlv)
+      continue;
+    check_lv(idx + 1, lv + 1, &need);
+    exp = (unsigned int *)rec;
+    if (need && *exp < need)
+      *exp = need;
+  }
+}
+
+static void sw_lvup_on_frame(void) {
+  int f = sw_in_fight();
+  if (f && !g_lvup_was_fight)
+    g_lvup_applied = 0;
+  g_lvup_was_fight = f;
+}
+
+static void j_CalLevel(void) {
+  /* 胜利界面会多次调用 CalLevel。每场战斗只补一次下一级经验，
+   * 否则升完一级又被补到再下一级，会连升到满级。 */
+  if (g_auto_level && !g_lvup_applied) {
+    sw_force_next_level_exp();
+    g_lvup_applied = 1;
+  }
+  CalLevel_orig();
+}
+
+static int sw_role_is_man(void *role) {
+  int (*check)(void *) = (int (*)(void *))sw_sym("_ZN4ROLE8CheckManEv");
+  return role && check && check(role);
+}
+
+static void sw_onehit_finish(void *atk, void *def) {
+  void (*setdeath)(void *, int);
+
+  if (!g_one_hit || !atk || !def || atk == def)
+    return;
+  if (!sw_role_is_man(atk) || sw_role_is_man(def))
+    return;
+  setdeath = (void (*)(void *, int))sw_sym("_ZN4ROLE8SetDeathEb");
+  if (setdeath)
+    setdeath(def, 1);
+}
+
+static void j_HitDamage1(void *atk, void *def) {
+  HitDamage1_orig(atk, def);
+  sw_onehit_finish(atk, def);
+}
+
+static void j_HitDamage3(void *atk, void *def, short *a, short *b) {
+  HitDamage3_orig(atk, def, a, b);
+  sw_onehit_finish(atk, def);
+}
+
+static void sw_hook_chance_of_battle(void) {
+  uintptr_t fn = so_find_addr_safe("_Z14ChanceOfBattleii");
+  if (!fn) {
+    debugPrintf("[patch] ChanceOfBattle not found\n");
+    return;
+  }
+  ChanceOfBattle_orig = sw_make_draw_tramp(fn);
+  if (!ChanceOfBattle_orig) {
+    debugPrintf("[patch] ChanceOfBattle tramp mmap failed\n");
+    return;
+  }
+  hook_arm64(fn, (uintptr_t)j_ChanceOfBattle);
+  debugPrintf("[patch] ChanceOfBattle -> no-encounter toggle\n");
+}
+
+static void sw_hook_cal_level(void) {
+  uintptr_t fn = so_find_addr_safe("_Z8CalLevelv");
+  if (!fn) {
+    debugPrintf("[patch] CalLevel not found\n");
+    return;
+  }
+  CalLevel_orig = sw_make_draw_tramp(fn);
+  if (!CalLevel_orig) {
+    debugPrintf("[patch] CalLevel tramp mmap failed\n");
+    return;
+  }
+  hook_arm64(fn, (uintptr_t)j_CalLevel);
+  debugPrintf("[patch] CalLevel -> post-battle level-up toggle\n");
+}
+
+static void sw_hook_hit_damage(void) {
+  uintptr_t a = so_find_addr_safe("_ZN4ROLE9HitDamageERS_");
+  uintptr_t b = so_find_addr_safe("_ZN4ROLE9HitDamageERS_PsS1_");
+
+  if (a) {
+    HitDamage1_orig = sw_make_draw_tramp(a);
+    if (HitDamage1_orig) {
+      hook_arm64(a, (uintptr_t)j_HitDamage1);
+      debugPrintf("[patch] ROLE::HitDamage(ROLE&) -> one-hit toggle\n");
+    }
+  }
+  if (b) {
+    HitDamage3_orig = sw_make_draw_tramp(b);
+    if (HitDamage3_orig) {
+      hook_arm64(b, (uintptr_t)j_HitDamage3);
+      debugPrintf("[patch] ROLE::HitDamage(ROLE&,s*,s*) -> one-hit toggle\n");
+    }
+  }
+  if (!HitDamage1_orig && !HitDamage3_orig)
+    debugPrintf("[patch] ROLE::HitDamage not found\n");
+}
+
+static int j_CheckObsolt(void *this, void *target) {
+  if (g_catch_ok)
+    return 1;
+  return CheckObsolt_orig(this, target);
+}
+
+static void sw_hook_check_obsolt(void) {
+  uintptr_t fn = so_find_addr_safe("_ZN8MAN_ROLE11CheckObsoltER4ROLE");
+  if (!fn) {
+    debugPrintf("[patch] CheckObsolt not found\n");
+    return;
+  }
+  CheckObsolt_orig = sw_make_draw_tramp(fn);
+  if (!CheckObsolt_orig) {
+    debugPrintf("[patch] CheckObsolt tramp mmap failed\n");
+    return;
+  }
+  hook_arm64(fn, (uintptr_t)j_CheckObsolt);
+  debugPrintf("[patch] MAN_ROLE::CheckObsolt -> catch-ok toggle\n");
 }
 
 static void sw_hook_commbutton_draw(void) {
@@ -610,6 +820,279 @@ static int sw_handle_menu_man(SDL_Event *ev) {
   return 0;
 }
 
+static int *sw_game_var(void) {
+  static int *p;
+  if (!p)
+    p = (int *)sw_sym("gGameVar");
+  return p;
+}
+
+static int sw_cheat_money(void) {
+  int *gv = sw_game_var();
+  return gv ? *gv : 0;
+}
+
+static void sw_cheat_set_status(const char *s) {
+  snprintf(g_cheat_status, sizeof(g_cheat_status), "%s", s);
+  g_cheat_status_until = SDL_GetTicks() + 1500;
+}
+
+static void sw_cheat_apply_money(void) {
+  int *gv = sw_game_var();
+  if (!gv) {
+    sw_cheat_set_status("找不到金钱");
+    return;
+  }
+  *gv = SW_CHEAT_MONEY_MAX;
+  sw_cheat_set_status("金钱已拉满");
+}
+
+static void sw_cheat_apply_hp(void) {
+  void (*gtl)(void);
+  int (*slot)(int);
+  void (*sethp)(void *, short, short, short);
+  char *base;
+  int i, n = 0;
+
+  gtl = (void (*)(void))sw_sym("_Z11GetTeamListv");
+  slot = (int (*)(int))sw_sym("_Z16GetTeamList_sloti");
+  sethp = (void (*)(void *, short, short, short))sw_sym("_ZN4ROLE5SetHpEsss");
+  base = (char *)sw_sym("manrole");
+  if (!gtl || !slot || !sethp || !base) {
+    sw_cheat_set_status("找不到角色数据");
+    return;
+  }
+  gtl();
+  for (i = 0; i < 3; i++) {
+    int idx = slot(i);
+    if (idx < 0 || idx > 9)
+      continue;
+    sethp(base + (size_t)idx * SW_ROLE_STRIDE, -1, -1, -1);
+    n++;
+  }
+  if (n)
+    sw_cheat_set_status("全员已满血");
+  else
+    sw_cheat_set_status("队伍是空的");
+}
+
+static void sw_cheat_toggle_noenc(void) {
+  g_no_encounter = !g_no_encounter;
+  sw_cheat_set_status(g_no_encounter ? "不遇敌已开" : "不遇敌已关");
+}
+
+static void sw_cheat_toggle_lvup(void) {
+  g_auto_level = !g_auto_level;
+  sw_cheat_set_status(g_auto_level ? "战后升级已开" : "战后升级已关");
+}
+
+static void sw_cheat_toggle_ohko(void) {
+  g_one_hit = !g_one_hit;
+  sw_cheat_set_status(g_one_hit ? "一击必杀已开" : "一击必杀已关");
+}
+
+static void sw_cheat_toggle_catch(void) {
+  g_catch_ok = !g_catch_ok;
+  sw_cheat_set_status(g_catch_ok ? "抓怪必成已开" : "抓怪必成已关");
+}
+
+static void sw_cheat_apply(void) {
+  if (g_cheat_sel == SW_CHEAT_MONEY)
+    sw_cheat_apply_money();
+  else if (g_cheat_sel == SW_CHEAT_HP)
+    sw_cheat_apply_hp();
+  else if (g_cheat_sel == SW_CHEAT_NOENC)
+    sw_cheat_toggle_noenc();
+  else if (g_cheat_sel == SW_CHEAT_LVUP)
+    sw_cheat_toggle_lvup();
+  else if (g_cheat_sel == SW_CHEAT_OHKO)
+    sw_cheat_toggle_ohko();
+  else if (g_cheat_sel == SW_CHEAT_CATCH)
+    sw_cheat_toggle_catch();
+  else
+    g_cheat_open = 0;
+}
+
+static int sw_handle_cheat_pad(SDL_Event *ev) {
+  int down, btn;
+
+  if (ev->type != SDL_CONTROLLERBUTTONDOWN &&
+      ev->type != SDL_CONTROLLERBUTTONUP)
+    return 0;
+  down = ev->type == SDL_CONTROLLERBUTTONDOWN;
+  btn = ev->cbutton.button;
+  if (btn == SDL_CONTROLLER_BUTTON_Y) {
+    if (down) {
+      g_cheat_open = !g_cheat_open;
+      if (g_cheat_open) {
+        g_cheat_sel = 0;
+        g_cheat_status[0] = 0;
+      }
+    }
+    ev->cbutton.button = (Uint8)-1;
+    return 1;
+  }
+  if (!g_cheat_open)
+    return 0;
+  if (down) {
+    if (btn == SDL_CONTROLLER_BUTTON_DPAD_UP)
+      g_cheat_sel = (g_cheat_sel + SW_CHEAT_N - 1) % SW_CHEAT_N;
+    else if (btn == SDL_CONTROLLER_BUTTON_DPAD_DOWN)
+      g_cheat_sel = (g_cheat_sel + 1) % SW_CHEAT_N;
+    else if (btn == SDL_CONTROLLER_BUTTON_A)
+      sw_cheat_apply();
+    else if (btn == SDL_CONTROLLER_BUTTON_B)
+      g_cheat_open = 0;
+  }
+  ev->cbutton.button = (Uint8)-1;
+  return 1;
+}
+
+static TTF_Font *sw_cheat_open_font(void) {
+  static const char *names[] = {"CS.ttf", "CT.ttf", NULL};
+  char path[1536];
+  const char *app;
+  int i;
+  int (*ttf_init)(void);
+
+  if (g_cheat_font)
+    return g_cheat_font;
+  ttf_init = (int (*)(void))dlsym(RTLD_DEFAULT, "TTF_Init");
+  if (ttf_init)
+    ttf_init();
+  app = getenv("ANDROID_APP_PATH");
+  for (i = 0; names[i]; i++) {
+    if (g_basedir[0]) {
+      snprintf(path, sizeof(path), "%s/assets/Resource/%s", g_basedir, names[i]);
+      g_cheat_font = TTF_OpenFont(path, 18);
+      if (g_cheat_font)
+        return g_cheat_font;
+    }
+    if (app && app[0]) {
+      snprintf(path, sizeof(path), "%s/Resource/%s", app, names[i]);
+      g_cheat_font = TTF_OpenFont(path, 18);
+      if (g_cheat_font)
+        return g_cheat_font;
+    }
+  }
+  debugPrintf("[cheat] TTF_OpenFont failed (CS/CT.ttf)\n");
+  return NULL;
+}
+
+static void sw_cheat_text(SDL_Renderer *r, int x, int y, const char *s,
+                          SDL_Color c) {
+  SDL_Surface *surf;
+  SDL_Texture *tex;
+  SDL_Rect dst;
+  TTF_Font *font = sw_cheat_open_font();
+
+  if (!font || !s || !s[0])
+    return;
+  surf = TTF_RenderUTF8_Blended(font, s, c);
+  if (!surf)
+    return;
+  tex = SDL_CreateTextureFromSurface(r, surf);
+  if (tex) {
+    dst.x = x;
+    dst.y = y;
+    dst.w = surf->w;
+    dst.h = surf->h;
+    SDL_RenderCopy(r, tex, NULL, &dst);
+    SDL_DestroyTexture(tex);
+  }
+  SDL_FreeSurface(surf);
+}
+
+static void sw_cheat_present(void *renderer) {
+  SDL_Renderer *r = (SDL_Renderer *)renderer;
+  SDL_BlendMode old_bm;
+  Uint8 or_, og, ob, oa;
+  int sw, sh, pw, ph, px, py, i;
+  SDL_Rect dim, box, hi;
+  char gold[64];
+  char item[32];
+  static const char *items[] = {"金钱最大", "全员满血", NULL, NULL, NULL, NULL, "关闭"};
+  SDL_Color title = {255, 220, 120, 255};
+  SDL_Color on = {255, 255, 210, 255};
+  SDL_Color off = {210, 200, 180, 255};
+  SDL_Color hint = {170, 160, 140, 255};
+  SDL_Color ok = {140, 230, 150, 255};
+
+  if (!g_cheat_open || !r)
+    return;
+  sw = egl_shim_screen_w > 0 ? egl_shim_screen_w : SW_NATIVE_W;
+  sh = egl_shim_screen_h > 0 ? egl_shim_screen_h : SW_NATIVE_H;
+  pw = 360;
+  ph = 376;
+  px = (sw - pw) / 2;
+  py = (sh - ph) / 2;
+  SDL_GetRenderDrawBlendMode(r, &old_bm);
+  SDL_GetRenderDrawColor(r, &or_, &og, &ob, &oa);
+  SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_BLEND);
+  dim.x = 0;
+  dim.y = 0;
+  dim.w = sw;
+  dim.h = sh;
+  SDL_SetRenderDrawColor(r, 0, 0, 0, 140);
+  SDL_RenderFillRect(r, &dim);
+  box.x = px;
+  box.y = py;
+  box.w = pw;
+  box.h = ph;
+  SDL_SetRenderDrawColor(r, 28, 22, 16, 230);
+  SDL_RenderFillRect(r, &box);
+  SDL_SetRenderDrawColor(r, 210, 170, 70, 255);
+  SDL_RenderDrawRect(r, &box);
+  box.x += 2;
+  box.y += 2;
+  box.w -= 4;
+  box.h -= 4;
+  SDL_RenderDrawRect(r, &box);
+  sw_cheat_text(r, px + 24, py + 16, "修改器", title);
+  sw_cheat_text(r, px + 100, py + 18, "mod by kk(k源机)", hint);
+  snprintf(gold, sizeof(gold), "金钱  %d", sw_cheat_money());
+  sw_cheat_text(r, px + 24, py + 48, gold, hint);
+  for (i = 0; i < SW_CHEAT_N; i++) {
+    const char *label;
+    int iy = py + 84 + i * 32;
+    if (i == SW_CHEAT_NOENC) {
+      snprintf(item, sizeof(item), "不遇敌    %s",
+               g_no_encounter ? "开" : "关");
+      label = item;
+    } else if (i == SW_CHEAT_LVUP) {
+      snprintf(item, sizeof(item), "战后升级  %s",
+               g_auto_level ? "开" : "关");
+      label = item;
+    } else if (i == SW_CHEAT_OHKO) {
+      snprintf(item, sizeof(item), "一击必杀  %s",
+               g_one_hit ? "开" : "关");
+      label = item;
+    } else if (i == SW_CHEAT_CATCH) {
+      snprintf(item, sizeof(item), "抓怪必成  %s",
+               g_catch_ok ? "开" : "关");
+      label = item;
+    } else {
+      label = items[i];
+    }
+    if (i == g_cheat_sel) {
+      hi.x = px + 16;
+      hi.y = iy - 4;
+      hi.w = pw - 32;
+      hi.h = 28;
+      SDL_SetRenderDrawColor(r, 90, 70, 28, 220);
+      SDL_RenderFillRect(r, &hi);
+      sw_cheat_text(r, px + 28, iy, label, on);
+    } else {
+      sw_cheat_text(r, px + 28, iy, label, off);
+    }
+  }
+  sw_cheat_text(r, px + 24, py + 316, "A 确定   B/Y 关闭   上下选择", hint);
+  if (g_cheat_status[0] && SDL_GetTicks() < g_cheat_status_until)
+    sw_cheat_text(r, px + 24, py + 342, g_cheat_status, ok);
+  SDL_SetRenderDrawBlendMode(r, old_bm);
+  SDL_SetRenderDrawColor(r, or_, og, ob, oa);
+}
+
 static void sw_push_right_click(int down) {
   SDL_Event e;
   SDL_Window *w;
@@ -629,9 +1112,14 @@ static void sw_push_right_click(int down) {
 
 int sw_SDL_PollEvent(SDL_Event *ev) {
   int r = SDL_PollEvent(ev);
+  sw_lvup_on_frame();
   if (r > 0 &&
       (ev->type == SDL_CONTROLLERBUTTONDOWN ||
        ev->type == SDL_CONTROLLERBUTTONUP)) {
+    if (sw_handle_cheat_pad(ev)) {
+      egl_shim_tls_restore();
+      return r;
+    }
     if (ev->cbutton.button == SDL_CONTROLLER_BUTTON_B) {
       int down = ev->type == SDL_CONTROLLERBUTTONDOWN;
       if (sw_in_fight() && g_extra_sel) {
@@ -847,6 +1335,7 @@ int main(int argc, char *argv[]) {
   /* 2) 预载 secondary .so 到全局符号域（RTLD_GLOBAL）+ 设备 GLES 驱动。 */
   char basedir[1024];
   sw_dir(basedir, sizeof(basedir), argv[0]);
+  snprintf(g_basedir, sizeof(g_basedir), "%s", basedir);
   debugPrintf("Loader dir: %s\n", basedir);
   load_device_gles();
   load_secondary_libs(basedir);
@@ -896,6 +1385,10 @@ int main(int argc, char *argv[]) {
   sw_hook_game_func("_Z14GetAPKXFileLenv", "GetAPKXFileLenv");
   sw_hook_game_func("_Z17GetAPKXFileOffsetv", "GetAPKXFileOffsetv");
   sw_hook_commbutton_draw();
+  sw_hook_chance_of_battle();
+  sw_hook_cal_level();
+  sw_hook_hit_damage();
+  sw_hook_check_obsolt();
   sw_hook_uigamepad();
 
   /* 2023 SDL_SS2D::Init 结尾用 tpidr+0x28 做 canary。glibc 上该槽会被 Mali/PNG
@@ -948,6 +1441,7 @@ int main(int argc, char *argv[]) {
   debugPrintf("nativeSetupJNI...\n");
   if (p_nativeSetupJNI) p_nativeSetupJNI(fake_env, cls);
 
+  egl_shim_set_present_hook(sw_cheat_present);
   debugPrintf("SDL_main ...\n");
   /* Init 入口前钉死 bionic canary。2023 SO 的 SDL_SS2D::Init 结尾会校验
    * tpidr+0x28；Mali/PNG 会改掉这个槽，误走 "Couldn't create window" 分支刷屏。 */

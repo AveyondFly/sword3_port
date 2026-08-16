@@ -77,6 +77,9 @@ int egl_shim_SDL_GetDesktopDisplayMode(int displayIndex, void *mode);
 int egl_shim_SDL_GetDisplayMode(int displayIndex, int modeIndex, void *mode);
 int egl_shim_SDL_GetDisplayBounds(int displayIndex, void *rect);
 void *egl_shim_SDL_CreateRenderer(struct SDL_Window *w, int index, unsigned int flags);
+void *egl_shim_get_renderer(void);
+void egl_shim_set_present_hook(void (*fn)(void *renderer));
+void egl_shim_SDL_RenderPresent(void *renderer);
 int egl_shim_SDL_RenderSetLogicalSize(void *renderer, int w, int h);
 int egl_shim_SDL_RenderCopy(void *renderer, void *texture,
                             const void *srcrect, const void *dstrect);

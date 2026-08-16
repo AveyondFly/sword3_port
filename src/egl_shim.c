@@ -243,9 +243,20 @@ int egl_shim_SDL_GetDisplayBounds(int displayIndex, void *rect) {
   return 0;
 }
 
+static SDL_Renderer *egl_renderer;
+static void (*egl_present_hook)(void *renderer);
+
+void *egl_shim_get_renderer(void) { return egl_renderer; }
+
+void egl_shim_set_present_hook(void (*fn)(void *renderer)) {
+  egl_present_hook = fn;
+}
+
 void *egl_shim_SDL_CreateRenderer(SDL_Window *w, int index, Uint32 flags) {
   if (!w) w = egl_window;
   SDL_Renderer *r = SDL_CreateRenderer(w, index, flags);
+  if (r)
+    egl_renderer = r;
   if (r && egl_shim_screen_w > 0 && egl_shim_screen_h > 0) {
     SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "linear");
     SDL_RenderSetLogicalSize(r, egl_shim_screen_w, egl_shim_screen_h);
@@ -255,6 +266,14 @@ void *egl_shim_SDL_CreateRenderer(SDL_Window *w, int index, Uint32 flags) {
     debugPrintf("egl_shim: CreateRenderer FAILED: %s\n", SDL_GetError());
   }
   return r;
+}
+
+void egl_shim_SDL_RenderPresent(void *renderer) {
+  SDL_Renderer *r = renderer ? (SDL_Renderer *)renderer : egl_renderer;
+  if (egl_present_hook && r)
+    egl_present_hook(r);
+  if (r)
+    SDL_RenderPresent(r);
 }
 
 int egl_shim_SDL_RenderSetLogicalSize(void *renderer, int w, int h) {
