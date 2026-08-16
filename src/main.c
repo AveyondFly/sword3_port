@@ -236,8 +236,8 @@ static Uint32 g_cheat_status_until;
 static TTF_Font *g_cheat_font;
 static int (*ChanceOfBattle_orig)(int, int);
 static void (*CalLevel_orig)(void);
-static void (*HitDamage1_orig)(void *, void *);
-static void (*HitDamage3_orig)(void *, void *, short *, short *);
+static int (*HitDamage1_orig)(void *, void *);
+static int (*HitDamage3_orig)(void *, void *, short *, short *);
 static int (*CheckObsolt_orig)(void *, void *);
 static int (*CheckKeeperEscape_orig)(void *, unsigned short);
 
@@ -492,31 +492,87 @@ static void j_CalLevel(void) {
   CalLevel_orig();
 }
 
+#define SW_MSROLE_STRIDE 0x3068
+#define SW_MSROLE_N      20
+
 static int sw_role_is_man(void *role) {
   int (*check)(void *) = (int (*)(void *))sw_sym("_ZN4ROLE8CheckManEv");
   return role && check && check(role);
 }
 
-static void sw_onehit_finish(void *atk, void *def) {
-  void (*setdeath)(void *, int);
+static int sw_role_is_manrole_slot(void *role) {
+  char *base = (char *)sw_sym("manrole");
+  int i;
 
-  if (!g_one_hit || !atk || !def || atk == def)
-    return;
+  if (!role || !base)
+    return 0;
+  for (i = 0; i < 10; i++) {
+    if (role == (void *)(base + (size_t)i * SW_ROLE_STRIDE))
+      return 1;
+  }
+  return 0;
+}
+
+static int sw_role_is_msrole_slot(void *role) {
+  char *base = (char *)sw_sym("msrole");
+  int i;
+
+  if (!role || !base)
+    return 0;
+  for (i = 0; i < SW_MSROLE_N; i++) {
+    if (role == (void *)(base + (size_t)i * SW_MSROLE_STRIDE))
+      return 1;
+  }
+  return 0;
+}
+
+static int sw_onehit_finish(void *atk, void *def) {
+  void (*setdeath)(void *, int);
+  void (*callife)(void *, int, short, short);
+  static int nlog;
+
+  if (!g_one_hit || !atk || !def)
+    return 0;
+  if (nlog < 16) {
+    debugPrintf("[onehit] atk=%p def=%p man=%d/%d slotM=%d/%d slotMs=%d/%d "
+                "manrole=%p msrole=%p\n",
+                atk, def, sw_role_is_man(atk), sw_role_is_man(def),
+                sw_role_is_manrole_slot(atk), sw_role_is_manrole_slot(def),
+                sw_role_is_msrole_slot(atk), sw_role_is_msrole_slot(def),
+                sw_sym("manrole"), sw_sym("msrole"));
+    nlog++;
+  }
+  if (atk == def)
+    return 0;
+  /* 能对上槽位才排除：对不上就退回最初的 CheckMan 秒杀，避免再整段失效。 */
+  if (sw_role_is_msrole_slot(atk) || sw_role_is_manrole_slot(def))
+    return 0;
   if (!sw_role_is_man(atk) || sw_role_is_man(def))
-    return;
+    return 0;
+  /* 最初能秒，是因为钩子把 HitDamage 返回值冲掉，调用方再按 ~9999 结算。
+   * 只 SetDeath 不够，血还在。这里补致命伤害并让返回值也是 9999。 */
+  callife = (void (*)(void *, int, short, short))sw_sym("_ZN4ROLE7CalLifeEiss");
+  if (callife)
+    callife(def, 9999, 0, 0);
   setdeath = (void (*)(void *, int))sw_sym("_ZN4ROLE8SetDeathEb");
   if (setdeath)
     setdeath(def, 1);
+  debugPrintf("[onehit] APPLY def=%p\n", def);
+  return 1;
 }
 
-static void j_HitDamage1(void *atk, void *def) {
-  HitDamage1_orig(atk, def);
-  sw_onehit_finish(atk, def);
+static int j_HitDamage1(void *atk, void *def) {
+  int dmg = HitDamage1_orig(atk, def);
+  if (sw_onehit_finish(atk, def))
+    return 9999;
+  return dmg;
 }
 
-static void j_HitDamage3(void *atk, void *def, short *a, short *b) {
-  HitDamage3_orig(atk, def, a, b);
-  sw_onehit_finish(atk, def);
+static int j_HitDamage3(void *atk, void *def, short *a, short *b) {
+  int dmg = HitDamage3_orig(atk, def, a, b);
+  if (sw_onehit_finish(atk, def))
+    return 9999;
+  return dmg;
 }
 
 static void sw_hook_chance_of_battle(void) {
