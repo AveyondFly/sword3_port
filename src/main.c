@@ -781,10 +781,92 @@ static int sw_handle_extra_pad(SDL_Event *ev) {
   return 0;
 }
 
-/* 系统子菜单换人：只拦 L1/R1（游戏默认 key 25/26）。方向左右不拦。 */
+/* 系统子菜单换人：只拦 L1/R1（游戏默认 key 25/26）。方向左右不拦。
+ * 第一次开菜单还在顶栏。菜单栏停在物品时按 A 才进物品栏，这时才把
+ * fcs_Level 设成 2，并把 fShiftTab 指到 propShiftTab。
+ * inMenuSystem 未初始化是 -1，不能当“在菜单里”。进栏后它经常是 0，
+ * L1/R1 仍要拦，否则 25/26 送不进去。 */
 static int sw_in_menu_system(void) {
   int *p = (int *)sw_sym("inMenuSystem");
-  return p && *p;
+  return p && *p > 0 && *p < 32;
+}
+
+static int sw_sys_page(void) {
+  int *p = (int *)sw_sym("SysPage");
+  return p ? *p : -1;
+}
+
+static int sw_item_subs(void) {
+  int *sub = (int *)sw_sym("fcs_Sub");
+  return sub && *sub >= 30 && *sub <= 32;
+}
+
+static void sw_log_menu_state(const char *why) {
+  int *in = (int *)sw_sym("inMenuSystem");
+  int *page = (int *)sw_sym("SysPage");
+  int *slv = (int *)sw_sym("SysLevel");
+  int *flv = (int *)sw_sym("fcs_Level");
+  int *sub = (int *)sw_sym("fcs_Sub");
+  void **fs = (void **)sw_sym("fShiftTab");
+  void *prop = sw_sym("_Z12propShiftTabv");
+
+  debugPrintf("[menu-init] %s in=%d page=%d syslv=%d fcslv=%d sub=%d shift=%s\n",
+              why, in ? *in : -999, page ? *page : -1, slv ? *slv : -1,
+              flv ? *flv : -1, sub ? *sub : -1,
+              (fs && prop && *fs == prop) ? "prop" : "other");
+}
+
+/* 菜单栏停在物品、还没进子项。in==-1 的加载阶段不算。 */
+static int sw_on_item_menubar(void) {
+  int *slv = (int *)sw_sym("SysLevel");
+  int *flv = (int *)sw_sym("fcs_Level");
+
+  if (sw_in_menu_system() && sw_sys_page() == 0 && slv && *slv == 0)
+    return 1;
+  if (flv && *flv == 1 && sw_item_subs() &&
+      (sw_sys_page() == 0 || !sw_in_menu_system()))
+    return 1;
+  return 0;
+}
+
+static int g_item_bag_arm;
+static int g_item_bag_ready;
+static Uint32 g_item_bag_arm_tick;
+
+static void sw_bind_prop_shift(void) {
+  int *flv = (int *)sw_sym("fcs_Level");
+  void **fs = (void **)sw_sym("fShiftTab");
+  void *prop = sw_sym("_Z12propShiftTabv");
+
+  if (flv)
+    *flv = 2;
+  if (fs && prop)
+    *fs = prop;
+}
+
+static void sw_enter_item_bag(void) {
+  sw_bind_prop_shift();
+  g_item_bag_ready = 1;
+  g_item_bag_arm = 0;
+  sw_log_menu_state("A-enter-item");
+}
+
+/* A 先交给游戏进栏，再写 fcs_Level / fShiftTab。开菜单时改会崩。 */
+static void sw_try_enter_item_bag(void) {
+  if (g_item_bag_ready && sw_sys_page() > 0)
+    g_item_bag_ready = 0;
+  if (!g_item_bag_arm)
+    return;
+  if (sw_sys_page() > 0) {
+    g_item_bag_arm = 0;
+    return;
+  }
+  if (SDL_GetTicks() - g_item_bag_arm_tick < 16)
+    return;
+  if (sw_on_item_menubar() || sw_item_subs())
+    sw_enter_item_bag();
+  else
+    g_item_bag_arm = 0;
 }
 
 static void sw_menu_man_key(int key, int down) {
@@ -797,27 +879,31 @@ static void sw_menu_man_key(int key, int down) {
     upd(din, key, down);
 }
 
+static int sw_want_shoulder(void) {
+  return sw_in_menu_system() || (g_item_bag_ready && sw_item_subs());
+}
+
 static int sw_handle_menu_man(SDL_Event *ev) {
   int down, btn;
 
-  if (!sw_in_menu_system())
+  if (!sw_want_shoulder())
     return 0;
   if (ev->type != SDL_CONTROLLERBUTTONDOWN &&
       ev->type != SDL_CONTROLLERBUTTONUP)
     return 0;
   down = ev->type == SDL_CONTROLLERBUTTONDOWN;
   btn = ev->cbutton.button;
-  if (btn == SDL_CONTROLLER_BUTTON_LEFTSHOULDER) {
-    sw_menu_man_key(25, down);
-    ev->cbutton.button = (Uint8)-1;
-    return 1;
-  }
-  if (btn == SDL_CONTROLLER_BUTTON_RIGHTSHOULDER) {
-    sw_menu_man_key(26, down);
-    ev->cbutton.button = (Uint8)-1;
-    return 1;
-  }
-  return 0;
+  if (btn != SDL_CONTROLLER_BUTTON_LEFTSHOULDER &&
+      btn != SDL_CONTROLLER_BUTTON_RIGHTSHOULDER)
+    return 0;
+  if (g_item_bag_ready && sw_item_subs())
+    sw_bind_prop_shift();
+  sw_menu_man_key(btn == SDL_CONTROLLER_BUTTON_LEFTSHOULDER ? 25 : 26, down);
+  if (down)
+    sw_log_menu_state(btn == SDL_CONTROLLER_BUTTON_LEFTSHOULDER ? "L1"
+                                                                : "R1");
+  ev->cbutton.button = (Uint8)-1;
+  return 1;
 }
 
 static int *sw_game_var(void) {
@@ -1113,6 +1199,7 @@ static void sw_push_right_click(int down) {
 int sw_SDL_PollEvent(SDL_Event *ev) {
   int r = SDL_PollEvent(ev);
   sw_lvup_on_frame();
+  sw_try_enter_item_bag();
   if (r > 0 &&
       (ev->type == SDL_CONTROLLERBUTTONDOWN ||
        ev->type == SDL_CONTROLLERBUTTONUP)) {
@@ -1138,6 +1225,13 @@ int sw_SDL_PollEvent(SDL_Event *ev) {
       ev->cbutton.button = (Uint8)-1;
     } else if (ev->cbutton.button == SDL_CONTROLLER_BUTTON_START) {
       ev->cbutton.button = (Uint8)-1;
+    } else if (ev->cbutton.button == SDL_CONTROLLER_BUTTON_A) {
+      if (ev->type == SDL_CONTROLLERBUTTONDOWN && sw_on_item_menubar()) {
+        g_item_bag_arm = 1;
+        g_item_bag_arm_tick = SDL_GetTicks();
+        sw_log_menu_state("A-item-bar");
+      }
+      sw_handle_extra_pad(ev);
     } else if (!sw_handle_menu_man(ev)) {
       sw_handle_extra_pad(ev);
     }
