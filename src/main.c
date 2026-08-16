@@ -475,6 +475,31 @@ static void sw_force_next_level_exp(void) {
   }
 }
 
+static int sw_role_fill_hp(void *role) {
+  void (*sethp)(void *, short, short, short);
+  unsigned char *p = role;
+  int *data;
+
+  if (!p)
+    return 0;
+  /* 空槽没有人/神魔/符鬼/NPC 旗标。 */
+  if (!p[0x3048] && !p[0x3049] && !p[0x304a] && !p[0x304b])
+    return 0;
+  sethp = (void (*)(void *, short, short, short))sw_sym("_ZN4ROLE5SetHpEsss");
+  /* +0x3030 且 [this+8]：-1 表示当前=上限。神魔等走 [this+24]，-1 会写成 -1。 */
+  if (p[0x3030] && *(void **)(p + 8)) {
+    if (sethp)
+      sethp(role, -1, -1, -1);
+    return 1;
+  }
+  data = *(int **)(p + 24);
+  if (data) {
+    data[20] = data[26];
+    return 1;
+  }
+  return 0;
+}
+
 static void sw_lvup_on_frame(void) {
   int f = sw_in_fight();
   if (f && !g_lvup_was_fight)
@@ -1018,27 +1043,32 @@ static void sw_cheat_apply_money(void) {
 }
 
 static void sw_cheat_apply_hp(void) {
-  void (*gtl)(void);
-  int (*slot)(int);
   void (*sethp)(void *, short, short, short);
-  char *base;
+  char *roles;
+  char *mainrole;
   int i, n = 0;
 
-  gtl = (void (*)(void))sw_sym("_Z11GetTeamListv");
-  slot = (int (*)(int))sw_sym("_Z16GetTeamList_sloti");
   sethp = (void (*)(void *, short, short, short))sw_sym("_ZN4ROLE5SetHpEsss");
-  base = (char *)sw_sym("manrole");
-  if (!gtl || !slot || !sethp || !base) {
+  roles = (char *)sw_sym("manrole");
+  mainrole = (char *)sw_sym("MainRole");
+  if (!sethp || !roles) {
     sw_cheat_set_status("找不到角色数据");
     return;
   }
-  gtl();
-  for (i = 0; i < 3; i++) {
-    int idx = slot(i);
-    if (idx < 0 || idx > 9)
-      continue;
-    sethp(base + (size_t)idx * SW_ROLE_STRIDE, -1, -1, -1);
-    n++;
+  /* 按 manrole 槽位补，不用 GetTeamList 的角色 ID（和槽位不是一回事）。 */
+  for (i = 0; i < 10; i++)
+    n += sw_role_fill_hp(roles + (size_t)i * SW_ROLE_STRIDE);
+  /* 野外状态栏读的是 MainRole，和战斗里 manrole 不是同一份。 */
+  if (mainrole) {
+    for (i = 0; i < 4; i++) {
+      short *rec = (short *)(mainrole + (size_t)i * SW_MAINROLE_STRIDE);
+      if (rec[5] <= 0)
+        continue;
+      rec[2] = rec[5];
+      rec[3] = rec[6];
+      rec[4] = rec[7];
+      n++;
+    }
   }
   if (n)
     sw_cheat_set_status("全员已满血");
