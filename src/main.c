@@ -925,11 +925,14 @@ static void sw_log_menu_state(const char *why) {
               (fs && prop && *fs == prop) ? "prop" : "other");
 }
 
-/* 菜单栏停在物品、还没进子项。in==-1 的加载阶段不算。 */
+/* 菜单栏停在物品、还没进子项。装备页也是 page=0/syslv=0，但 sub=36，不能当物品栏。 */
 static int sw_on_item_menubar(void) {
   int *slv = (int *)sw_sym("SysLevel");
   int *flv = (int *)sw_sym("fcs_Level");
+  int *sub = (int *)sw_sym("fcs_Sub");
 
+  if (sub && *sub == 36)
+    return 0;
   if (sw_in_menu_system() && sw_sys_page() == 0 && slv && *slv == 0)
     return 1;
   if (flv && *flv == 1 && sw_item_subs() &&
@@ -941,16 +944,53 @@ static int sw_on_item_menubar(void) {
 static int g_item_bag_arm;
 static int g_item_bag_ready;
 static Uint32 g_item_bag_arm_tick;
+static void *g_shift_prev;
+static int g_level_prev;
+static int g_shift_bound;
+static int g_was_equip;
 
 static void sw_bind_prop_shift(void) {
   int *flv = (int *)sw_sym("fcs_Level");
   void **fs = (void **)sw_sym("fShiftTab");
   void *prop = sw_sym("_Z12propShiftTabv");
 
+  if (fs && prop && *fs != prop) {
+    g_shift_prev = *fs;
+    g_level_prev = flv ? *flv : 0;
+    g_shift_bound = 1;
+  }
   if (flv)
     *flv = 2;
   if (fs && prop)
     *fs = prop;
+}
+
+static void sw_unbind_prop_shift(void) {
+  int *flv = (int *)sw_sym("fcs_Level");
+  void **fs = (void **)sw_sym("fShiftTab");
+  void *prop = sw_sym("_Z12propShiftTabv");
+
+  if (!g_shift_bound)
+    return;
+  if (fs && prop && *fs == prop)
+    *fs = g_shift_prev;
+  if (flv && *flv == 2)
+    *flv = g_level_prev;
+  g_shift_bound = 0;
+  g_item_bag_ready = 0;
+}
+
+static int sw_in_equip(void) {
+  void **fe = (void **)sw_sym("fExecute");
+  void *eq = sw_sym("_Z12equipExecutev");
+  int *sub = (int *)sw_sym("fcs_Sub");
+
+  /* 只用 sub=36 / equipExecute。fShiftTab==equipIconChg 离开后可能还粘着。 */
+  if (sub && *sub == 36)
+    return 1;
+  if (fe && eq && *fe == eq)
+    return 1;
+  return 0;
 }
 
 static void sw_enter_item_bag(void) {
@@ -960,13 +1000,23 @@ static void sw_enter_item_bag(void) {
   sw_log_menu_state("A-enter-item");
 }
 
-/* A 先交给游戏进栏，再写 fcs_Level / fShiftTab。开菜单时改会崩。 */
+/* A 先交给游戏进栏，再写 fcs_Level / fShiftTab。开菜单时改会崩。
+ * 物品栏逻辑不动。进装备页不要误挂 prop；离开装备/关掉菜单才卸钩。 */
 static void sw_try_enter_item_bag(void) {
+  int *in = (int *)sw_sym("inMenuSystem");
+  int now_equip = sw_in_equip();
+
+  if (g_was_equip && !now_equip)
+    sw_unbind_prop_shift();
+  g_was_equip = now_equip;
+  /* 已进过物品栏、菜单真正关了（in=-1）。第一次开菜单 in=-1 时还没 bind。 */
+  if (g_shift_bound && in && *in < 0 && !g_item_bag_arm)
+    sw_unbind_prop_shift();
   if (g_item_bag_ready && sw_sys_page() > 0)
     g_item_bag_ready = 0;
   if (!g_item_bag_arm)
     return;
-  if (sw_sys_page() > 0) {
+  if (sw_sys_page() > 0 || now_equip) {
     g_item_bag_arm = 0;
     return;
   }
@@ -989,6 +1039,13 @@ static void sw_menu_man_key(int key, int down) {
 }
 
 static int sw_want_shoulder(void) {
+  int *in = (int *)sw_sym("inMenuSystem");
+
+  /* 菜单已关：再送 25/26 会让 DrawRoleIcon2 去读装备已释放的 ManData2。 */
+  if (in && *in < 0)
+    return 0;
+  if (sw_in_equip())
+    return sw_in_menu_system();
   return sw_in_menu_system() || (g_item_bag_ready && sw_item_subs());
 }
 
