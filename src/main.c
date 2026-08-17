@@ -234,12 +234,15 @@ static int g_refine_ok;
 static char g_cheat_status[64];
 static Uint32 g_cheat_status_until;
 static TTF_Font *g_cheat_font;
+static TTF_Font *g_credit_font;
 static int (*ChanceOfBattle_orig)(int, int);
 static void (*CalLevel_orig)(void);
 static int (*HitDamage1_orig)(void *, void *);
 static int (*HitDamage3_orig)(void *, void *, short *, short *);
 static int (*CheckObsolt_orig)(void *, void *);
 static int (*CheckKeeperEscape_orig)(void *, unsigned short);
+static void (*RootDialog_redraw_orig)(void);
+static int g_on_title;
 
 static void *sw_sym(const char *name) {
   return (void *)so_find_addr_safe(name);
@@ -1293,6 +1296,20 @@ static TTF_Font *sw_cheat_open_font(void) {
         return g_cheat_font;
     }
   }
+  {
+    static const char *sysfonts[] = {
+        "/usr/share/fonts/liberation/LiberationSans-Regular.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSansCondensed.ttf",
+        "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
+        NULL};
+    for (i = 0; sysfonts[i]; i++) {
+      g_cheat_font = TTF_OpenFont(sysfonts[i], 18);
+      if (g_cheat_font) {
+        debugPrintf("[cheat] TTF_OpenFont %s\n", sysfonts[i]);
+        return g_cheat_font;
+      }
+    }
+  }
   debugPrintf("[cheat] TTF_OpenFont failed (CS/CT.ttf)\n");
   return NULL;
 }
@@ -1315,6 +1332,7 @@ static void sw_cheat_text(SDL_Renderer *r, int x, int y, const char *s,
     dst.y = y;
     dst.w = surf->w;
     dst.h = surf->h;
+    SDL_SetTextureBlendMode(tex, SDL_BLENDMODE_BLEND);
     SDL_RenderCopy(r, tex, NULL, &dst);
     SDL_DestroyTexture(tex);
   }
@@ -1421,6 +1439,114 @@ static void sw_cheat_present(void *renderer) {
     sw_cheat_text(r, px + 24, py + 406, g_cheat_status, ok);
   SDL_SetRenderDrawBlendMode(r, old_bm);
   SDL_SetRenderDrawColor(r, or_, og, ob, oa);
+}
+
+/* 标题页（开始游戏 / 读取进度）由 RootDialog_redraw 每帧绘制，fExecute 此时是 0。 */
+static void j_RootDialog_redraw(void) {
+  g_on_title = 1;
+  RootDialog_redraw_orig();
+  g_on_title = 1;
+}
+
+static void sw_hook_title_credit(void) {
+  uintptr_t fn = so_find_addr_safe("_Z17RootDialog_redrawv");
+
+  if (!fn) {
+    debugPrintf("[title] RootDialog_redraw not found\n");
+    return;
+  }
+  RootDialog_redraw_orig = sw_make_draw_tramp(fn);
+  if (!RootDialog_redraw_orig) {
+    debugPrintf("[title] RootDialog_redraw tramp mmap failed\n");
+    return;
+  }
+  hook_arm64(fn, (uintptr_t)j_RootDialog_redraw);
+  debugPrintf("[title] RootDialog_redraw -> credit overlay\n");
+}
+
+static TTF_Font *sw_credit_open_font(void) {
+  int (*ttf_init)(void);
+
+  if (g_credit_font)
+    return g_credit_font;
+  ttf_init = (int (*)(void))dlsym(RTLD_DEFAULT, "TTF_Init");
+  if (ttf_init)
+    ttf_init();
+  {
+    static const char *sysfonts[] = {
+        "/usr/share/fonts/liberation/LiberationSans-Regular.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSansCondensed.ttf",
+        "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
+        NULL};
+    int i;
+    for (i = 0; sysfonts[i]; i++) {
+      g_credit_font = TTF_OpenFont(sysfonts[i], 15);
+      if (g_credit_font) {
+        debugPrintf("[title] credit font %s\n", sysfonts[i]);
+        return g_credit_font;
+      }
+    }
+  }
+  return sw_cheat_open_font();
+}
+
+static void sw_title_credit_present(void *renderer) {
+  SDL_Renderer *r = (SDL_Renderer *)renderer;
+  TTF_Font *font;
+  SDL_Surface *surf;
+  SDL_Texture *tex;
+  SDL_Rect dst, bar;
+  SDL_BlendMode old_bm;
+  Uint8 or_, og, ob, oa;
+  SDL_Color ink = {236, 230, 214, 255};
+  int sh, pad = 6;
+  static int nlog;
+
+  if (!r || !g_on_title)
+    return;
+  g_on_title = 0;
+  font = sw_credit_open_font();
+  if (!font)
+    return;
+  surf = TTF_RenderUTF8_Blended(font, "ported by windstarry", ink);
+  if (!surf)
+    return;
+  sh = egl_shim_screen_h > 0 ? egl_shim_screen_h : SW_NATIVE_H;
+  /* 左下竖着的大宇印章大约在 x=28..43。字放在它右侧，并垫半透明底。 */
+  dst.w = surf->w;
+  dst.h = surf->h;
+  dst.x = 52;
+  dst.y = sh - dst.h - 14;
+  SDL_GetRenderDrawBlendMode(r, &old_bm);
+  SDL_GetRenderDrawColor(r, &or_, &og, &ob, &oa);
+  SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_BLEND);
+  bar.x = dst.x - pad;
+  bar.y = dst.y - 3;
+  bar.w = dst.w + pad * 2;
+  bar.h = dst.h + 6;
+  SDL_SetRenderDrawColor(r, 8, 10, 20, 155);
+  SDL_RenderFillRect(r, &bar);
+  SDL_SetRenderDrawColor(r, 190, 176, 140, 70);
+  SDL_RenderDrawRect(r, &bar);
+  tex = SDL_CreateTextureFromSurface(r, surf);
+  if (tex) {
+    SDL_SetTextureBlendMode(tex, SDL_BLENDMODE_BLEND);
+    SDL_RenderCopy(r, tex, NULL, &dst);
+    SDL_DestroyTexture(tex);
+  }
+  SDL_FreeSurface(surf);
+  SDL_SetRenderDrawBlendMode(r, old_bm);
+  SDL_SetRenderDrawColor(r, or_, og, ob, oa);
+  if (nlog < 4) {
+    debugPrintf("[title] credit draw x=%d y=%d %dx%d\n", dst.x, dst.y, dst.w,
+                dst.h);
+    nlog++;
+  }
+}
+
+static void sw_overlay_present(void *renderer) {
+  sw_title_credit_present(renderer);
+  sw_cheat_present(renderer);
 }
 
 static void sw_push_right_click(int down) {
@@ -1729,6 +1855,7 @@ int main(int argc, char *argv[]) {
   sw_hook_check_obsolt();
   sw_hook_keeper_escape();
   sw_hook_uigamepad();
+  sw_hook_title_credit();
 
   /* 2023 SDL_SS2D::Init 结尾用 tpidr+0x28 做 canary。glibc 上该槽会被 Mali/PNG
    * 改掉 → 误走 "Couldn't create window" 并和第二次 canary 检查死循环刷屏。
@@ -1780,7 +1907,7 @@ int main(int argc, char *argv[]) {
   debugPrintf("nativeSetupJNI...\n");
   if (p_nativeSetupJNI) p_nativeSetupJNI(fake_env, cls);
 
-  egl_shim_set_present_hook(sw_cheat_present);
+  egl_shim_set_present_hook(sw_overlay_present);
   debugPrintf("SDL_main ...\n");
   /* Init 入口前钉死 bionic canary。2023 SO 的 SDL_SS2D::Init 结尾会校验
    * tpidr+0x28；Mali/PNG 会改掉这个槽，误走 "Couldn't create window" 分支刷屏。 */
