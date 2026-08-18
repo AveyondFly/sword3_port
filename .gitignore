@@ -19,3 +19,6 @@ src/_unused_katanazero/
 
 # 游戏 .so 备份（BYO-data，不入库）
 libs/*.bak-*
+
+# WorkBuddy 本地工作目录（含 memory/ 等，仅本地辅助数据，不入库不推送）
+.workbuddy/
