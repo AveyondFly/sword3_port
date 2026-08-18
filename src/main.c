@@ -1,5 +1,5 @@
 /*
- * main.c — 仙剑奇侠传三 (Sword3 / com.softstar.G.swd3e) ARM64 so-loader for NextOS.
+ * main.c — 轩辕剑3天之痕 (Sword3 / com.softstar.G.swd3e) ARM64 so-loader for NextOS.
  *
  * 纯 SDL2 2D 游戏（入口 SDL_main）。libSWD3E.so 动态链接一组 Android .so：
  *   libc++_shared, libSDL2, libSDL2_image, libSDL2_mixer, libSDL2_ttf,
@@ -114,7 +114,7 @@ static void crash_handler(int sig, siginfo_t *info, void *uc) {
   /* 二进制级追踪（满足“定位具体崩溃点”需求）：
    * 1) backtrace：崩溃瞬间完整调用栈（库名+偏移），定位 fSetFilePointer 的调用方；
    * 2) /proc/self/maps：把 PC 等运行时地址映射到具体库+偏移。
-   * 两者经 fd2(stderr) 直写，避免缓冲；sword3.sh 的 tee 会把 stderr 落 debug.log。 */
+   * 两者经 fd2(stderr) 直写，避免缓冲；swd3de.sh 的 tee 会把 stderr 落 debug.log。 */
   {
     void *frames[64];
     int n = backtrace(frames, 64);
@@ -1772,7 +1772,7 @@ int main(int argc, char *argv[]) {
   install_crash_handler();
   sw_kill_prior_instances();
   sw_cpu_performance();
-  debugPrintf("=== 仙剑奇侠传三 (Sword3) ARM64 so-loader (NextOS) ===\n");
+  debugPrintf("=== 轩辕剑3天之痕 (Sword3) ARM64 so-loader (NextOS) ===\n");
   /* 启动横幅加策略标识：随包 SDL2_image + 部署期 LIBC->WEAK（便于现场日志核对）。 */
   debugPrintf("[build] %s %s (A=confirm B=hold-right / fight-back)\n",
               __DATE__, __TIME__);

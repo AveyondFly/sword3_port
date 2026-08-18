@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# build_docker.sh — 仙剑奇侠传三 (Sword3 / com.softstar.G.swd3e) ARM64 so-loader
+# build_docker.sh — 轩辕剑3天之痕 (Sword3 / com.softstar.G.swd3e) ARM64 so-loader
 # 交叉编译脚本。在 ghcr.io/monkeyx-net/portmaster-build-templates/portmaster-builder:aarch64-latest
 # (aarch64 交叉工具链 + SDL2 头文件 + Mali GLES 库) 内编译 loader，输出 `sword3`。
 #

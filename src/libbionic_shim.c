@@ -1050,7 +1050,7 @@ static void shim_hexdump(const char *label, const void *p, int n) {
 }
 
 /* ---- 中文编码转码（#1 不显示文字的根因修复）----
- * 仙剑等中文 Windows 移植游戏把 GBK / Big5 字节直接喂给 TTF_RenderUTF8_*，
+ * 轩辕剑3天之痕等中文 Windows 移植游戏把 GBK / Big5 字节直接喂给 TTF_RenderUTF8_*，
  * 而 SDL_ttf 按 UTF-8 解析 —— 多字节序列非法 → 渲染空面 → 屏幕无文字。
  * 这里在 wrapper 内检测：若入参非合法 UTF-8，则按 GBK→Big5→GB18030 顺序尝试
  * 转码为 UTF-8 再交给真函数。iconv 任一编码失败则回退原串（不劣化现状）。 */

@@ -1,7 +1,7 @@
 /*
  * liblog_stub.c — Android liblog.so 的最小替身（glibc/Linux 环境用）。
  *
- * 仙剑三的 Android .so（libhidapi / libSDL2_mixer / libSDL2_ttf ...）在 NEEDED
+ * 轩辕剑3天之痕的 Android .so（libhidapi / libSDL2_mixer / libSDL2_ttf ...）在 NEEDED
  * 里声明 liblog.so，且运行期会调用 __android_log_*。Linux 设备没有 liblog，
  * 这里提供一个只把日志转发到 stderr 的桩，避免 dlopen/符号解析失败。
  *

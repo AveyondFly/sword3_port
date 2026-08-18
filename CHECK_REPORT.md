@@ -18,7 +18,7 @@
 
 | 位置 | 内容 | 含义 |
 |------|------|------|
-| `sword3.sh:151` | `export SUMMERTIME_CURSOR=1` | **会画调试光标角标** |
+| `swd3de.sh:151` | `export SUMMERTIME_CURSOR=1` | **会画调试光标角标** |
 | `src/egl_shim.c:671-673` `draw_port_cursor()` | `if (cursor && strcmp(cursor,"0")==0) return;` | 仅当 `=0` 才关闭光标绘制 |
 | `README.md:83` / `docs/PROGRESS.md:40` / `docs/HANDOFF.md:108` | "关调试光标（`SUMMERTIME_CURSOR=0`）" | 文档统一要求关闭 |
 | `src/egl_shim.c:122-124` 注释 | "启动脚本设 `SUMMERTIME_CURSOR=0` 关闭它" | 设计意图为 0 |
@@ -30,8 +30,8 @@
 ## 2. BUG-2（高 · 需你拍板）STAGING 内的 `libSDL2_image.so` 设备版软链与"严禁设备版"铁律冲突
 
 **现象**：
-- `sword3.sh:118` `ln -sf /usr/lib/libSDL2_image-2.0.so.0 "$STAGING/libSDL2_image.so"`
-- `sword3.sh:137` `LD_LIBRARY_PATH="$STAGING:$GAMEDIR:..."` —— STAGING 在最前。
+- `swd3de.sh:118` `ln -sf /usr/lib/libSDL2_image-2.0.so.0 "$STAGING/libSDL2_image.so"`
+- `swd3de.sh:137` `LD_LIBRARY_PATH="$STAGING:$GAMEDIR:..."` —— STAGING 在最前。
 - `src/main.c:1741-1742` 在基于 `basedir` 的随包版 `dlopen` 失败时，有 `alt="/usr/lib/libSDL2_image-2.0.so.0"` 兜底（**容忍设备版**）。
 
 **文档铁律（冲突方）**：
@@ -40,23 +40,23 @@
 **风险链路**：若部署期 `patch_libs.sh` 漏跑或随包版 LIBC 未弱化 → 基于 `basedir` 的随包版 `dlopen` 失败 → 全局域落入设备版 → 游戏内部经裸名 `libSDL2_image.so` 解析命中 STAGING 设备版软链 → 黑屏（即 Bug A 复发）。
 
 **需你决策**：当前固件下设备版 `/usr/lib/libSDL2_image-2.0.so.0` 的 `IMG_Load` 是否真的会黑屏？
-- 若仍黑屏（维持铁律）：应删除 `sword3.sh:118` 的 STAGING 软链（让裸名回退到基于 `basedir` 的随包版），并移去 `main.c:1741-1742` 的设备版 fallback。
+- 若仍黑屏（维持铁律）：应删除 `swd3de.sh:118` 的 STAGING 软链（让裸名回退到基于 `basedir` 的随包版），并移去 `main.c:1741-1742` 的设备版 fallback。
 - 若当前固件已可用（铁律过时）：则 `main.c` 的 fallback 与脚本软链合理，但须同步修订 README/HANDOFF 的铁律表述，避免误导。
 
 ---
 
 ## 3. 矛盾-3（中）启动器启动方式文档不清
 
-- `README.md:78` 写 `bash /storage/roms/ports/sword3/sword3.sh`，该路径在 ROCKNIX 下
+- `README.md:78` 写 `bash /storage/roms/ports/sword3/swd3de.sh`，该路径在 ROCKNIX 下
   （`$directory=/storage/roms`、`GAMEDIR=$directory/ports/sword3`）是**正确**的绝对路径，
-  脚本确实位于 `ports/sword3/sword3.sh`，并非多了一层。
+  脚本确实位于 `ports/sword3/swd3de.sh`，并非多了一层。
 - 真正问题在于 README **未说明必须经 PortMaster 启动**：脚本的 `$directory` 由 PortMaster
   `control.txt` 注入，脱离 PortMaster 手动 `bash` 会因 `$directory` 未定义得到错误 `GAMEDIR`。
-- `FIX_REPORT.md:4` 称启动器是 `/storage/roms/ports/sword3.sh`（少一层 `sword3/`），与脚本实际
-  部署位置（`ports/sword3/sword3.sh`）不符，属该报告笔误。
+- `FIX_REPORT.md:4` 称启动器是 `/storage/roms/ports/swd3de.sh`（少一层 `sword3/`），与脚本实际
+  部署位置（`ports/sword3/swd3de.sh`）不符，属该报告笔误。
 
 建议：README 保留 ROCKNIX 绝对路径作示例，但补注"须经 PortMaster 启动、`$directory` 由
-`control.txt` 提供、路径随固件而变（`$directory/ports/sword3/sword3.sh`）"。
+`control.txt` 提供、路径随固件而变（`$directory/ports/sword3/swd3de.sh`）"。
 
 ---
 
@@ -98,7 +98,7 @@ HANDOFF §4 实机测试清单仍有多个 `[ ]`，部分已被 FIX_REPORT 覆�
 
 | 项 | 动作 | 风险 |
 |----|------|------|
-| BUG-1 | `sword3.sh` `SUMMERTIME_CURSOR=1` → `0` | 低（确定笔误） |
+| BUG-1 | `swd3de.sh` `SUMMERTIME_CURSOR=1` → `0` | 低（确定笔误） |
 | 矛盾-3 | 修正 README 启动命令 + 注明 PortMaster 依赖 | 低 |
 | 矛盾-4 | 统一部署 IP 或改脚本支持 `$1` 传参 | 低 |
 | 遗留-6 | `.gitignore` 加 `src/_unused_katanazero/`；归档诊断产物 | 低 |

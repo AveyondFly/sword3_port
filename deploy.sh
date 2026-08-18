@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# deploy.sh — 仙剑奇侠传三 (Sword3 / com.softstar.G.swd3e) ARM64 so-loader 部署编排器
+# deploy.sh — 轩辕剑3天之痕 (Sword3 / com.softstar.G.swd3e) ARM64 so-loader 部署编排器
 #
 # 职责：build → 暂存交付物 → 部署期 patch(LIBC->WEAK) → 打印推送指引。
 # 游戏 .so 与 assets/ 为 BYO-data（不入库），由用户自备放入暂存目录后再整体推送。
@@ -45,7 +45,7 @@ bash build_docker.sh
 
 echo "==> [2/4] stage deliverables into $STAGING"
 mkdir -p "$STAGING"
-for f in sword3 libbionic_shim.so liblog.so sword3.sh README.md; do
+for f in sword3 libbionic_shim.so liblog.so swd3de.sh README.md; do
   if [ -f "$f" ]; then
     cp -f "$f" "$STAGING/"
   else
@@ -77,6 +77,6 @@ echo ""
 echo "    设备侧首次部署只需一次（幂等，FAT 可写文件，无 symlink 需求）："
 echo "      ssh root@<device> 'bash $GAMEDIR/tools/patch_libs.sh $GAMEDIR'"
 echo "    然后启动："
-echo "      ssh root@<device> 'bash $GAMEDIR/sword3.sh'"
+echo "      ssh root@<device> 'bash $GAMEDIR/swd3de.sh'"
 echo ""
 echo "==> 完成。注意：游戏 .so 与 assets/ 须自备放入 $STAGING（BYO-data，不入库）。"

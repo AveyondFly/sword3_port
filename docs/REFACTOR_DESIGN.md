@@ -2,7 +2,7 @@
 
 > 重构类型：**架构清理（architecture cleanup）** —— 保留运行时行为，重组 loader 内部（加载顺序更清晰、shim 拆分/注释更清楚），不做完全重写。
 > 作者：架构师 高见远 ｜ 日期：2026-07-31
-> 基线源码：`E:\Programs\nextos-my-ports\ports\sword3`（src/ + build_docker.sh + sword3.sh + docs/）
+> 基线源码：`E:\Programs\nextos-my-ports\ports\sword3`（src/ + build_docker.sh + swd3de.sh + docs/）
 > 落地目标：`E:\Programs\NextOs-Ports\sword3`（当前为空目录）
 
 ---
@@ -11,7 +11,7 @@
 
 ### 0.1 用户锁定的三条决策
 1. **重构深度 = 架构清理**：保留运行时行为，重组 loader 内部（加载顺序更清晰、shim 拆分/注释更清楚），不做完全重写。
-2. **交付范围 = loader + 构建 + 部署 + 文档**：产出 `src/` + `build_docker.sh` + 部署期 patch 脚本 + 更新 `README.md` / `sword3.sh`，落盘到 `E:\Programs\NextOs-Ports\sword3`。
+2. **交付范围 = loader + 构建 + 部署 + 文档**：产出 `src/` + `build_docker.sh` + 部署期 patch 脚本 + 更新 `README.md` / `swd3de.sh`，落盘到 `E:\Programs\NextOs-Ports\sword3`。
 3. **SDL2_image 策略 = 随包 + patch_libs**：`main.c` 改回加载随包 `libSDL2_image.so`（去掉硬编码设备路径），部署期用 patch 脚本把全部 Android `.so` 的 `LIBC` 标 `WEAK`。
 
 ### 0.2 两个实机根因 bug（已实证）
@@ -37,7 +37,7 @@
 NextOs-Ports/sword3/                      # 交付根（= 未来 $GAMEDIR 的源码侧）
 ├── build_docker.sh          # [小改] aarch64 交叉编译；链接命令不变，补注释 + 加 liblog.so 构建
 ├── deploy.sh                # [新建] 编排：build → patch 暂存目录 → 给出推送指引
-├── sword3.sh                # [更新] 启动脚本（前台、单实例、中文 locale、SUMMERTIME_CURSOR=0）
+├── swd3de.sh                # [更新] 启动脚本（前台、单实例、中文 locale、SUMMERTIME_CURSOR=0）
 ├── README.md                # [更新] 数据布局（随包/设备）、启动流程、patch 步骤、已知项
 ├── docs/
 │   ├── REFACTOR_DESIGN.md   # 本文件（规划产物，非运行时交付）
@@ -65,7 +65,7 @@ NextOs-Ports/sword3/                      # 交付根（= 未来 $GAMEDIR 的源
     └── patch_libs.sh         # [新建] 薄包装：定位 python3 后调 patch_libs.py
 ```
 
-文件状态图例：**重点重写** = `main.c`、`tools/patch_libs.py`、`tools/patch_libs.sh`、`deploy.sh`、`README.md`、`sword3.sh`；**小改/补注释** = `build_docker.sh`、`docs/HANDOFF.md`；**原样复制** = `src/` 其余 `.c/.h`、`stubs/liblog_stub.c`、`docs/PROGRESS.md`、`src/_unused_katanazero/`。
+文件状态图例：**重点重写** = `main.c`、`tools/patch_libs.py`、`tools/patch_libs.sh`、`deploy.sh`、`README.md`、`swd3de.sh`；**小改/补注释** = `build_docker.sh`、`docs/HANDOFF.md`；**原样复制** = `src/` 其余 `.c/.h`、`stubs/liblog_stub.c`、`docs/PROGRESS.md`、`src/_unused_katanazero/`。
 
 ---
 
@@ -170,7 +170,7 @@ exec "$PY" "$HERE/patch_libs.py" "$@"
 职责：**build → patch → staging → 指引推送**。设计（非实现）：
 1. 调 `bash build_docker.sh` 产出 `sword3` + `libbionic_shim.so`（及新增的 `liblog.so`）。
 2. 取暂存目录参数（默认 `./deploy`，或 `$1`）；若不存在则创建。
-3. 拷贝交付物进暂存：`sword3`、`libbionic_shim.so`、`liblog.so`、`sword3.sh`、`README.md`。
+3. 拷贝交付物进暂存：`sword3`、`libbionic_shim.so`、`liblog.so`、`swd3de.sh`、`README.md`。
 4. 提示用户把**自备的游戏 Android `.so` + `assets/`** 放入同一暂存目录（BYO-data，不入库）。
 5. 调 `bash tools/patch_libs.sh "$STAGING"` 把全部 Android `.so` 的 `LIBC` 标 `WEAK`。
 6. 打印推送指引：`rsync/scp` 暂存目录 → 设备 `$GAMEDIR`（`/storage/roms/ports/sword3`）。
@@ -181,7 +181,7 @@ exec "$PY" "$HERE/patch_libs.py" "$@"
 - **两种落地方式（均在文档说明）**：
   - 推荐：在**主机**上对"含游戏 `.so` 的暂存目录"跑 `deploy.sh <staging>`（含 patch），再整体同步到设备 `$GAMEDIR`。
   - 兼容：直接在**设备** `$GAMEDIR` 跑一次 `bash tools/patch_libs.sh $GAMEDIR`（幂等，FAT 可写文件，无 symlink 需求）。
-- **不**在 `sword3.sh` 启动期自动 patch（保持启动脚本简单；patch 为一次性部署动作，README 明确标注）。
+- **不**在 `swd3de.sh` 启动期自动 patch（保持启动脚本简单；patch 为一次性部署动作，README 明确标注）。
 
 ---
 
@@ -195,7 +195,7 @@ exec "$PY" "$HERE/patch_libs.py" "$@"
 
 ---
 
-## 5. README.md / sword3.sh 更新点
+## 5. README.md / swd3de.sh 更新点
 
 ### 5.1 README.md
 - **数据布局**改为明确两栏表：
@@ -212,7 +212,7 @@ exec "$PY" "$HERE/patch_libs.py" "$@"
 - **已知项**更新：黑屏根因已定位（SDL2_image 误用设备版 + 漏跑 LIBC patch），标记已修复待实机验证；其余（Mali-G31/kmsdrm 渲染、音频、SMPEG、返回键）保留为待验证清单。
 - 引用 `docs/REFACTOR_DESIGN.md` 与 `docs/HANDOFF.md`。
 
-### 5.2 sword3.sh
+### 5.2 swd3de.sh
 - 维持现有职责（单实例、`LD_LIBRARY_PATH`、`中文 locale`、`SUMMERTIME_CURSOR=0`、performance governor、前台运行 + `tee` 日志）。
 - **新增提示**（非自动执行）：在脚本头部注释中注明"首次部署请确保已对 `$GAMEDIR` 跑过 `tools/patch_libs.sh`（LIBC→WEAK）"；可加一行 `echo` 提示（不打断运行）。
 - 确认 `LD_LIBRARY_PATH` 含 `$GAMEDIR` 首位（保证随包裸 soname `.so` 优先于设备版，防 `ld.so` 经软链误抓设备版）——现有已含，保留并加注释说明其防误抓作用。
@@ -237,11 +237,11 @@ exec "$PY" "$HERE/patch_libs.py" "$@"
 | T3 | 移植部署期 patch 脚本 | `tools/patch_libs.py`、`tools/patch_libs.sh` | 无 | R | P0 | 对样例 Android `.so` 能将 `LIBC` 标 `WEAK`；`--verify` 通过；白名单外文件不误改；幂等 |
 | T4 | 新增 deploy.sh 编排器 | `deploy.sh` | T3 | R | P1 | `deploy.sh <staging>` 能构建并产出"已 patch 的暂存目录"；`--verify` 可用 |
 | T5 | 改进 build_docker.sh | `build_docker.sh` | T1 | M | P1 | 链接命令逐字不变；注释说明 SDL2_image 不经链接 + patch 为部署期；新增 `liblog.so` 构建步骤且产出正确 |
-| T6 | 更新 sword3.sh / README.md / docs/HANDOFF.md | `sword3.sh`、`README.md`、`docs/HANDOFF.md` | T2,T3,T4 | M/R | P1 | 文档含"随包 vs 设备"两栏表、patch 步骤、SDL2_image 禁设备版说明；与实现一致 |
+| T6 | 更新 swd3de.sh / README.md / docs/HANDOFF.md | `swd3de.sh`、`README.md`、`docs/HANDOFF.md` | T2,T3,T4 | M/R | P1 | 文档含"随包 vs 设备"两栏表、patch 步骤、SDL2_image 禁设备版说明；与实现一致 |
 | T7（QA） | 集成验证：docker 编译 + patch 自测 + 逻辑审查 | 全量 | T1–T6 | — | P0 | `build_docker.sh` 在镜像内通过；patch 后样例 `.so` 用 `readelf` 可见 `LIBC` 为 `WEAK`、可 `dlopen`；`main.c` 加载顺序审计通过（见 QA 任务 #3） |
 
 **重点重写 vs 原样/小改**：
-- 重点重写/新建（R）：`src/main.c`、`tools/patch_libs.py`、`tools/patch_libs.sh`、`deploy.sh`、`README.md`、`sword3.sh`（部分）。
+- 重点重写/新建（R）：`src/main.c`、`tools/patch_libs.py`、`tools/patch_libs.sh`、`deploy.sh`、`README.md`、`swd3de.sh`（部分）。
 - 小改/补注释（M）：`build_docker.sh`、`docs/HANDOFF.md`。
 - 原样复制（C）：`src/` 其余 `.c/.h`、`stubs/liblog_stub.c`、`docs/PROGRESS.md`、`src/_unused_katanazero/`。
 
@@ -256,7 +256,7 @@ graph TD
     T3[T3 移植 patch_libs<br/>R · P0]
     T4[T4 新增 deploy.sh<br/>R · P1]
     T5[T5 改进 build_docker.sh<br/>M · P1]
-    T6[T6 更新文档/sword3.sh<br/>M/R · P1]
+    T6[T6 更新文档/swd3de.sh<br/>M/R · P1]
     T7[T7 集成验证 QA<br/>P0]
 
     T1 --> T2
