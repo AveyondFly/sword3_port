@@ -148,7 +148,7 @@ fi
 export LC_ALL="$LANG"
 
 # 关闭调试光标角标（egl_shim 默认画一个十字；2D 游戏自带光标，关掉）。
-export SUMMERTIME_CURSOR=1
+export SUMMERTIME_CURSOR=0
 
 # Governor performance：降低音频/引擎卡顿。
 for g in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do

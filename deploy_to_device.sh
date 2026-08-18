@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# sword3 修复产物部署到 Rocknix 掌机 (默认 192.168.31.16)
+# sword3 修复产物部署到 Rocknix 掌机 (默认 192.168.31.16；可用 $1 覆盖 IP)
 # 用途: 把已验证的 3 个修复产物覆盖到设备 /storage/roms/ports/sword3/ 并复测。
 # 运行环境: 在你【能连到掌机的本机】终端跑（不是 WorkBuddy 沙箱，它路由不到 192.168.31.x）。
 #   - 推荐: 装了 sshpass 的 Linux/Mac/WSL/Git-Bash(choco install sshpass)
 #   - 或: 纯手动 scp（脚本会在缺 sshpass 时打印命令）
 set -u
 
-IP="192.168.31.16"
+IP="${1:-192.168.31.16}"   # 可用第一个参数覆盖，如: bash deploy_to_device.sh 192.168.31.51
 USER="root"
 PASS="rocknix"
 REMOTE_DIR="/storage/roms/ports/sword3"

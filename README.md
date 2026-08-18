@@ -74,13 +74,16 @@ bash tools/patch_libs.sh --verify "$GAMEDIR"
 
 ## 启动
 
-```bash
-bash /storage/roms/ports/sword3/sword3.sh
-```
+> 本脚本由 **PortMaster** 经 `ports/` 调用，PortMaster 会注入 `$directory`（各固件不同：
+> ROCKNIX 为 `/storage/roms`、其余多为 `/roms`），脚本据此得到
+> `GAMEDIR="$directory/ports/sword3"`，因此**不要**脱离 PortMaster 手动 `bash` 本脚本
+> （`$directory` 未定义会得到错误路径）。ROCKNIX 下经 PortMaster 启动即
+> `/storage/roms/ports/sword3/sword3.sh`。
 
-启动脚本负责：单实例清理、设 `LD_LIBRARY_PATH`（**`$GAMEDIR` 必须首位**，防 `ld.so` 经软链误抓
-设备版）、设中文 locale（默认 `zh_CN.UTF-8`，繁体改 `zh_TW.UTF-8`）、关调试光标
-（`SUMMERTIME_CURSOR=0`）、performance governor。
+启动脚本负责：单实例清理、设 `LD_LIBRARY_PATH`（STAGING 软链设备 SDL2 全家桶置于最前、
+`$GAMEDIR` 紧随其后，防 `ld.so` 误抓设备版 `libSDL2_image`）、设中文 locale
+（默认 `zh_CN.UTF-8`，繁体改 `zh_TW.UTF-8`）、关调试光标（`SUMMERTIME_CURSOR=0`）、
+performance governor。
 
 资源路径前缀带 `assets/`：loader 把 `ANDROID_APP_PATH/ANDROID_ARGUMENT/ANDROID_PRIVATE`
 设为 `$GAMEDIR/assets`，命中 `SDL_RWFromFile("Resource/...", ...)`。
