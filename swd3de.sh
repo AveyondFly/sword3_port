@@ -1,5 +1,5 @@
 #!/bin/bash
-# 仙剑奇侠传三 (Sword3 / com.softstar.G.swd3e) — NextOS ARM64 so-loader launcher.
+# 轩辕剑3天之痕 (Sword3 / com.softstar.G.swd3e) — NextOS ARM64 so-loader launcher.
 #
 # 纯 SDL2 2D 游戏。设备侧 SDL2 自动选后端（Mali-450=fbdev,
 # RK3562/Mali-G52=kmsdrm, Mali-G31=wayland）—— 绝不强制 SDL_VIDEODRIVER（项目铁律）。
@@ -10,7 +10,7 @@
 #   libSWD3E.so libSDL2.so libSDL2_image.so libSDL2_mixer.so libSDL2_ttf.so
 #   libsmpeg2.so libhidapi.so libc++_shared.so   <- 游戏自带 Android .so
 #   assets/           <- 游戏资源（Resource/ Music/ Video/ zh-Hans/ zh-Hant/ ...）
-#   sword3-nextos.sh  <- 本脚本
+#   swd3de.sh  <- 本脚本
 
 XDG_DATA_HOME=${XDG_DATA_HOME:-$HOME/.local/share}
 
@@ -125,7 +125,7 @@ ln -sf /usr/lib/libm.so.6        "$STAGING/libm.so"
 ln -sf /usr/lib/libc.so.6        "$STAGING/libc.so"
 ln -sf /usr/lib/libz.so.1        "$STAGING/libz.so"
 # Android 版 libSDL2.so 的 NEEDED：libOpenSLES / libandroid 设备上没有。
-# 旧设备启动器会在这里放同名桩，仓库脚本漏了这一步 → 覆盖 ports/sword3.sh 后
+# 旧设备启动器会在这里放同名桩，仓库脚本漏了这一步 → 覆盖 ports/swd3de.sh 后
 # dlopen(Android libSDL2.so) 报缺库；glibc 还会按 soname 记住失败，连设备版
 # libSDL2.so 的回退也一起失败。
 if [ -f "$GAMEDIR/libOpenSLES.so" ]; then
@@ -173,7 +173,7 @@ chmod +x "$GAMEDIR/sword3" 2>/dev/null
 echo "=== Sword3 loader $(date -Is) ==="
 
 # ── 退出热键（修复"无法按 Select+Start 退出" #3）─────────────────────────────
-# 不再依赖 gptokeyb（本设备 control.txt 未暴露 $GPTOKEYB 变量；且仙剑为鼠标游戏、
+# 不再依赖 gptokeyb（本设备 control.txt 未暴露 $GPTOKEYB 变量；且轩辕剑3天之痕为鼠标游戏、
 # 手柄 evdev 空闲）。退出逻辑已下沉到 loader 二进制内部：main.c 启动一个后台线程，
 # 用设备侧 SDL2 实例每帧轮询物理手柄的 SELECT+START，命中即 _exit(0)（参考
 # gtalcs2 / nfs 的 in-binary exit 范式，不调用 teardown、不 kill 外部进程）。
