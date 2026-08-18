@@ -1,4 +1,4 @@
-# 仙剑奇侠传三 (Sword3 / `com.softstar.G.swd3e`) — NextOS ARM64 so-loader
+# 轩辕剑3天之痕 (Sword3 / `com.softstar.G.swd3e`) — NextOS ARM64 so-loader
 
 纯 SDL2 2D 游戏（大宇 Softstar）的 Android `.so` 在 NextOS Linux ARM64 上的 so-loader 移植。
 基于 summertimesaga 的 so-loader 范式改写：加载 Android 版 `libSWD3E.so`，用编译进 loader 的

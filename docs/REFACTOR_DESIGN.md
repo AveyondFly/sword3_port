@@ -1,4 +1,4 @@
-# 仙剑奇侠传三 (Sword3 / `com.softstar.G.swd3e`) so-loader 重构设计方案
+# 轩辕剑3天之痕 (Sword3 / `com.softstar.G.swd3e`) so-loader 重构设计方案
 
 > 重构类型：**架构清理（architecture cleanup）** —— 保留运行时行为，重组 loader 内部（加载顺序更清晰、shim 拆分/注释更清楚），不做完全重写。
 > 作者：架构师 高见远 ｜ 日期：2026-07-31
