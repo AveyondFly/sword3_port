@@ -1,6 +1,6 @@
 # Sword3 so-loader — 技术交接文档 (HANDOFF)
 
-> 端口：`com.softstar.G.swd3e`（仙剑奇侠传三，Softstar，SDL2 2D）
+> 端口：`com.softstar.G.swd3e`（轩辕剑3天之痕，Softstar，SDL2 2D）
 > 基线：summertimesaga so-loader 改写（同范式：加载 Android `.so` + 原生 shim）
 > 重构：2026-07-31 架构清理（仅重组 loader 内部 + 修实机 bug + 完善构建/部署/文档，运行时行为等价）
 > 日期：2026-07-31

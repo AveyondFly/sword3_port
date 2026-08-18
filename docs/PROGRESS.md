@@ -1,4 +1,4 @@
-# 仙剑奇侠传三 (Sword3) NextOS so-loader — 进展总结
+# 轩辕剑3天之痕 (Sword3) NextOS so-loader — 进展总结
 
 > 端口：`com.softstar.G.swd3e`（大宇 Softstar，纯 SDL2 2D 移植版）
 > 基线：summertimesaga so-loader 范式改写（加载 Android `.so` + 原生 shim 桥接）

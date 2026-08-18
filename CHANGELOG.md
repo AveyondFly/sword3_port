@@ -1,4 +1,4 @@
-# Changelog — 仙剑奇侠传三 (Sword3) ARM64 so-loader
+# Changelog — 轩辕剑3天之痕 (Sword3) ARM64 so-loader
 
 > 本文件汇总相对仓库基线（summertimesaga so-loader 范式）的修复与新功能。
 > 详细的移植进度与架构见 `docs/PROGRESS.md` 与 `docs/HANDOFF.md`。
@@ -19,7 +19,7 @@
 - **#1 中文编码检测**：`libbionic_shim` 拦截 `TTF_RenderUTF8_*`，按游戏实际打开的字体名
   （`CT.ttf`→BIG5 繁体 / `CS.ttf`→GBK 简体）推断编码并转 UTF-8，修复对话/剧情缺字乱码。
 - **#2 手柄→鼠标模拟**：`sw_input_thread` 将手柄映射为鼠标事件（右/左摇杆移动、方向键步进、
-  A/B 左/右键、L1/R1 滚轮），仙剑为鼠标 RPG，解决掌机无法操作。
+  A/B 左/右键、L1/R1 滚轮），轩辕剑3天之痕为鼠标 RPG，解决掌机无法操作。
 - **#3 退出热键下沉**：SELECT+START 在 loader 内部每帧轮询物理手柄并 `_exit(0)`，不再依赖 gptokeyb。
 - **内置修改器 (trainer)**：金钱 / 满血 / 不遇敌 / 一击必杀 / 抓怪 / 炼妖 / 符鬼 等开关。
 - **菜单换人 / 物品栏**：解绑装备后 L1/R1 的残留绑定，避免 `DrawRoleIcon2` 崩溃。
