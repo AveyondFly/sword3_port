@@ -13,3 +13,9 @@ assets/
 log.txt
 debug.log
 *.log
+
+# 误用脚手架反例（不应入库；原 PROGRESS/HANDOFF 称其已 git-ignored，实际未被忽略）
+src/_unused_katanazero/
+
+# 游戏 .so 备份（BYO-data，不入库）
+libs/*.bak-*
