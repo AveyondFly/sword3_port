@@ -105,7 +105,7 @@ launcher(sh) ──> sword3(bin)
 ports/sword3/  (NextOs-Ports/sword3)
 ├── build_docker.sh          # aarch64 交叉编译（sword3 + libbionic_shim.so + liblog.so）；链接命令不变
 ├── deploy.sh                # [2026-07-31 新增] build→staging→patch→推送指引
-├── sword3.sh                # 启动脚本（前台、单实例、中文 locale、SUMMERTIME_CURSOR=0）
+├── swd3de.sh                # 启动脚本（前台、单实例、中文 locale、SUMMERTIME_CURSOR=0）
 ├── README.md                # 端口说明（含随包/设备数据布局、patch 步骤、SDL2_image 禁设备版）
 ├── docs/
 │   ├── REFACTOR_DESIGN.md   # 架构清理设计方案（规划产物）

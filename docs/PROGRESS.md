@@ -37,7 +37,7 @@
 - **误用 katanazero 脚手架**：初始 `src/` 误入 `shims.c`/`imports.gen.c`/`pthread_bridge.c`，与 summertimesaga 派生、自包含的 `imports.c` 重定义冲突。已移入 `src/_unused_katanazero/`（git-ignored 反例），`src/` 恢复 summertimesaga 同款文件集。
 - **`glDrawTexfOES` 未定义引用**：docker 镜像 `libGLESv2` 不导出该 OES 扩展。改为 `imports.c` 内联运行时 `dlsym(RTLD_DEFAULT,"glDrawTexfOES")` + no-op 兜底。
 - **构建**：`bash build_docker.sh`（镜像 `ghcr.io/monkeyx-net/portmaster-build-templates/portmaster-builder:aarch64-latest`），链接 `-lSDL2 -lGLESv2 -lGLESv1_CM -ldl -lm -lpthread -lstdc++ -lgcc_s -rdynamic`。产物 `sword3`(181584B) / `libbionic_shim.so`(18544B)。
-- **交付**：`sword3.sh`（启动脚本，前台/单实例/中文 locale/`SUMMERTIME_CURSOR=0`/绝不强制 `SDL_VIDEODRIVER`）、`README.md`、`docs/HANDOFF.md`。
+- **交付**：`swd3de.sh`（启动脚本，前台/单实例/中文 locale/`SUMMERTIME_CURSOR=0`/绝不强制 `SDL_VIDEODRIVER`）、`README.md`、`docs/HANDOFF.md`。
 - 同步陷阱已记录：新 build 在 `ports/sword3/`，而 `deploy_run.py` 的 `LOCAL_DIR=test/sword3/sword3` 只上传该处；须 `cp -f ports/sword3/sword3 test/sword3/sword3/sword3` + shim 同步，避免上传陈旧 loader。
 
 ---
@@ -103,7 +103,7 @@
 2. 若仍 FAIL/崩溃 → 退路 hook `SDL_SS2D_LoadImage` 强制系统 `IMG_Load(filename)`（定位见 §4.4）。
 3. 解码通后实机验证主菜单渲染（Mali-G31 wayland / RK3562-Mali-G52 kmsdrm）。
 4. 处理 §5 次要项（存档路径、gptokeyb、SMPEG）。
-5. 同步最终可用改动到 `sword3.sh` + docs + memory。
+5. 同步最终可用改动到 `swd3de.sh` + docs + memory。
 
 ---
 
@@ -112,7 +112,7 @@
 ```
 ports/sword3/
 ├── build_docker.sh          # aarch64 交叉编译（sword3 + libbionic_shim.so）
-├── sword3.sh                # 启动脚本（前台/单实例/中文 locale/SUMMERTIME_CURSOR=0）
+├── swd3de.sh                # 启动脚本（前台/单实例/中文 locale/SUMMERTIME_CURSOR=0）
 ├── README.md                # 端口说明
 ├── docs/
 │   ├── HANDOFF.md           # 技术交接（符号核对/编译修复/运行期架构）
@@ -130,7 +130,7 @@ ports/sword3/
 └── libbionic_shim.so        # 18568B（git-ignored）
 
 test/sword3/                 # 实机部署区（git-ignored）
-├── sword3.sh                # 设备端 launcher（建 /tmp/sword3libs 符号链接、设 LD_LIBRARY_PATH）
+├── swd3de.sh                # 设备端 launcher（建 /tmp/sword3libs 符号链接、设 LD_LIBRARY_PATH）
 ├── sword3/                  # 上传的 loader + shim + 游戏 .so + assets（git-ignored）
 └── sword3.zip               # 游戏数据整包（git-ignored，BYO-data）
 ```

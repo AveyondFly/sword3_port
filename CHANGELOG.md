@@ -5,11 +5,11 @@
 
 ## 修复 (Fixes)
 
-- **启动脚本调试光标笔误** (`sword3.sh`)：原 `SUMMERTIME_CURSOR=1` 会每帧绘制调试光标角标，
+- **启动脚本调试光标笔误** (`swd3de.sh`)：原 `SUMMERTIME_CURSOR=1` 会每帧绘制调试光标角标，
   与 README / `egl_shim` 注释"关闭调试光标"意图相反，改为 `SUMMERTIME_CURSOR=0`。
 - **启动方式文档澄清** (`README.md`)：明确脚本须经 **PortMaster** 启动（由 `control.txt` 注入
   `$directory`），`GAMEDIR="$directory/ports/sword3"`；ROCKNIX 下即
-  `/storage/roms/ports/sword3/sword3.sh`。脱离 PortMaster 手动 `bash` 会因 `$directory`
+  `/storage/roms/ports/sword3/swd3de.sh`。脱离 PortMaster 手动 `bash` 会因 `$directory`
   未定义得到错误路径。
 - **部署脚本 IP 可参数化** (`deploy_to_device.sh`)：`IP` 支持 `$1` 覆盖（默认 `192.168.31.16`），
   适配测试设备 IP 不固定的场景。

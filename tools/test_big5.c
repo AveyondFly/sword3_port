@@ -1,5 +1,5 @@
 /* 验证 #1 修复在【繁体 / BIG5】模式下的正确性：
- * 模拟游戏把 BIG5 字节直接喂给 TTF_RenderUTF8_Blended（仙剑繁体 Windows 版行为）。
+ * 模拟游戏把 BIG5 字节直接喂给 TTF_RenderUTF8_Blended（轩辕剑3天之痕繁体 Windows 版行为）。
  * 通过 shim 的 fopen + SDL_RWFromFile 打开 CT.ttf（shim 据此把 g_ttf_enc 设为 BIG5），
  * 再用 iconv 把已知 UTF-8 串转成 BIG5 字节喂给渲染函数，确认 shim 用 BIG5 转回 UTF-8
  * 并渲染出非空表面。若 enc 显示 BIG5 且 surface 非空，即证明繁体路径正确。 */

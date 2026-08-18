@@ -1,7 +1,7 @@
 # 轩辕剑3天之痕 (Sword3) ARM64 移植 — #1 / #2 修复验证
 
 > 设备: Rocknix 掌机 `192.168.137.16` (root/rocknix), aarch64 Linux
-> 启动器: `/storage/roms/ports/sword3.sh`（**非** `.../sword3/sword3.sh`）
+> 启动器: `/storage/roms/ports/swd3de.sh`（**非** `.../sword3/swd3de.sh`）
 > 字体: `/storage/roms/ports/sword3/assets/Resource/CT.ttf`（繁体）
 > 构建镜像: `ghcr.io/monkeyx-net/portmaster-build-templates/portmaster-builder:aarch64-latest`
 
