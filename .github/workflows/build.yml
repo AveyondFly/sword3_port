@@ -1,0 +1,44 @@
+name: Build & Package (PortMaster)
+
+# 触发：
+#   - push 到 dev 分支自动构建（测试主路径）
+#   - workflow_dispatch 可在 Actions 页手动触发
+#   - 对 main 的 PR 也构建，作为合入前校验
+on:
+  push:
+    branches: [dev]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ghcr.io 镜像若设为私有，需在仓库 Settings→Secrets 配置 GHCR_TOKEN
+      # （含 read:packages 权限的 PAT）；公开镜像无需此步，条件跳过。
+      - name: Log in to GHCR (optional)
+        if: ${{ secrets.GHCR_TOKEN != '' }}
+        run: echo "${{ secrets.GHCR_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      # 直接复用本地 build_docker.sh：ubuntu-latest 自带 Docker 引擎，
+      # docker run 把仓库挂进镜像内编译，产物落回挂载目录（与本地流程零差异）。
+      - name: Build loader (docker, reuse build_docker.sh)
+        run: bash build_docker.sh
+
+      # 组装 PortMaster 端口目录并打包为 sword3.zip（跨平台 python zipfile）。
+      - name: Package PortMaster port
+        run: bash tools/package_portmaster.sh
+
+      - name: Upload port artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sword3-portmaster
+          path: dist/sword3.zip
+          if-no-files-found: error
