@@ -13,8 +13,14 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
+# Windows(Git Bash/MSYS) 下把 POSIX 路径转混合路径(E:/...)，否则传给 Windows 版
+# python3.exe 时路径翻译异常；Linux(CI runner) 下保持 POSIX，不做转换。
+case "$(uname -s 2>/dev/null)" in
+  MINGW*|MSYS*|CYGWIN*) HERE="$(cygpath -m "$HERE" 2>/dev/null || echo "$HERE")" ;;
+esac
 DIST="$HERE/dist"
 PORT="$DIST/sword3"
+PY="$(command -v python3 || command -v python || true)"
 rm -rf "$DIST"
 mkdir -p "$PORT"
 
@@ -27,6 +33,25 @@ for f in sword3 libbionic_shim.so liblog.so; do
   cp -f "$HERE/$f" "$PORT/$f"
   chmod +x "$PORT/$f"
 done
+
+echo "[*] 收集游戏自带 Android .so（入库，libs/；与 loader 同目录，main.c 按 dirname 加载）"
+shopt -s nullglob
+game_libs=("$HERE"/libs/*.so)
+shopt -u nullglob
+if [ ${#game_libs[@]} -eq 0 ]; then
+  echo "ERROR: libs/ 下未找到任何游戏 .so，请将 9 个随包 Android .so 放入 libs/（详见 libs/README.md）" >&2
+  exit 1
+fi
+for f in "${game_libs[@]}"; do
+  cp -f "$f" "$PORT/$(basename "$f")"
+done
+
+echo "[*] 对端口根目录内随包 Android .so 做 LIBC->WEAK patch（幂等，不改动 libs/ 源文件）"
+if [ -z "$PY" ]; then
+  echo "ERROR: 未找到 python3/python，无法执行 LIBC->WEAK patch" >&2
+  exit 1
+fi
+"$PY" "$HERE/tools/patch_libs.py" "$PORT" || true
 
 echo "[*] 收集启动脚本与元数据"
 cp -f "$HERE/swd3de.sh"       "$PORT/swd3de.sh"; chmod +x "$PORT/swd3de.sh"
@@ -44,7 +69,6 @@ WRAP
 chmod +x "$PORT/sword3.sh"
 
 echo "[*] 打包 $PORT -> $DIST/sword3.zip"
-PY="$(command -v python3 || command -v python)"
 "$PY" - "$PORT" "$DIST/sword3.zip" <<'PY'
 import os, sys, zipfile
 src, out = sys.argv[1], sys.argv[2]
