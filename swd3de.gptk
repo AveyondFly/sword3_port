@@ -1,0 +1,14 @@
+# swd3de.gptk — 轩辕剑3天之痕 手柄映射（占位）
+#
+# 说明：本端口退出逻辑已下沉进 loader 二进制（物理手柄 SELECT+START 退出），
+# 启动脚本未调用 gptokeyb，故此文件当前不生效；保留以符合 PortMaster 端口规范，
+# 供后续如需手柄映射时启用。本作为鼠标游戏，左摇杆映射为鼠标移动。
+
+[mouse]
+axis0=0
+axis1=1
+
+[keyboard]
+# A = 确认 / 鼠标左键
+# B = 取消 / 鼠标右键
+# 退出：SELECT + START（由 loader 内部处理）

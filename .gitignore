@@ -4,6 +4,7 @@ libbionic_shim.so
 liblog.so
 build/
 deploy/
+dist/
 
 # 游戏自带数据（BYO-data，不入库）
 *.so
