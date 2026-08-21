@@ -24,7 +24,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       # 复用 build_docker.sh：脚本内部 docker run 把 $PWD 挂载进镜像编译
       # （aarch64-linux-gnu-gcc 交叉工具链），产物落回挂载目录（与本地流程零差异）。
@@ -39,7 +39,7 @@ jobs:
         run: bash tools/package_portmaster.sh
 
       - name: Upload port artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: swd3de-portmaster
           path: dist/swd3de.zip
