@@ -207,7 +207,7 @@ static int sw_in_fight(void);
 
 #define SW_CHEAT_MONEY_MAX 99999999
 #define SW_ROLE_STRIDE     0x34c8
-#define SW_CHEAT_N         9
+#define SW_CHEAT_N         11
 #define SW_CHEAT_MONEY     0
 #define SW_CHEAT_HP        1
 #define SW_CHEAT_NOENC     2
@@ -216,7 +216,13 @@ static int sw_in_fight(void);
 #define SW_CHEAT_CATCH     5
 #define SW_CHEAT_REFINE    6
 #define SW_CHEAT_GHOST     7
-#define SW_CHEAT_CLOSE     8
+#define SW_CHEAT_XUE       8
+#define SW_CHEAT_YUER      9
+#define SW_CHEAT_CLOSE     10
+#define SW_AFF_XUE_GUID    2
+#define SW_AFF_YUER_GUID   3
+#define SW_AFF_VAR         1
+#define SW_AFF_MAX         255
 #define SW_MAINROLE_STRIDE 0x3c
 #define SW_GHOST_N         5
 #define SW_GHOST_TYPE_OFF  136
@@ -224,6 +230,7 @@ static int sw_in_fight(void);
 static int g_cheat_open;
 static int g_cheat_sel;
 static int g_cheat_ghost;
+static int g_cheat_aff[2];
 static int g_no_encounter;
 static int g_auto_level;
 static int g_lvup_applied;
@@ -1206,6 +1213,53 @@ static void sw_cheat_apply_ghost(void) {
   sw_cheat_set_status(msg);
 }
 
+static int sw_role_var(unsigned guid, unsigned var, unsigned *val,
+                       unsigned mode) {
+  int (*fn)(unsigned, unsigned, unsigned *, unsigned);
+
+  fn = (int (*)(unsigned, unsigned, unsigned *, unsigned))sw_sym(
+      "_Z8iRoleVarjjPjj");
+  if (!fn || !val)
+    return 0;
+  return fn(guid, var, val, mode);
+}
+
+static unsigned sw_aff_guid(int which) {
+  return which ? SW_AFF_YUER_GUID : SW_AFF_XUE_GUID;
+}
+
+static int sw_aff_read(int which) {
+  unsigned v = 0;
+
+  if (!sw_role_var(sw_aff_guid(which), SW_AFF_VAR, &v, 1))
+    return -1;
+  return (int)(v & 0xff);
+}
+
+static void sw_aff_load(void) {
+  g_cheat_aff[0] = sw_aff_read(0);
+  g_cheat_aff[1] = sw_aff_read(1);
+}
+
+static void sw_cheat_apply_aff(int which) {
+  unsigned v;
+  char msg[40];
+  int cur = g_cheat_aff[which];
+
+  if (cur < 0)
+    cur = 0;
+  if (cur > SW_AFF_MAX)
+    cur = SW_AFF_MAX;
+  v = (unsigned)cur;
+  if (!sw_role_var(sw_aff_guid(which), SW_AFF_VAR, &v, 2)) {
+    sw_cheat_set_status("找不到好感数据");
+    return;
+  }
+  g_cheat_aff[which] = cur;
+  snprintf(msg, sizeof(msg), "%s好感 %d", which ? "玉儿" : "小雪", cur);
+  sw_cheat_set_status(msg);
+}
+
 static void sw_cheat_apply(void) {
   if (g_cheat_sel == SW_CHEAT_MONEY)
     sw_cheat_apply_money();
@@ -1223,6 +1277,10 @@ static void sw_cheat_apply(void) {
     sw_cheat_toggle_refine();
   else if (g_cheat_sel == SW_CHEAT_GHOST)
     sw_cheat_apply_ghost();
+  else if (g_cheat_sel == SW_CHEAT_XUE)
+    sw_cheat_apply_aff(0);
+  else if (g_cheat_sel == SW_CHEAT_YUER)
+    sw_cheat_apply_aff(1);
   else
     g_cheat_open = 0;
 }
@@ -1241,6 +1299,7 @@ static int sw_handle_cheat_pad(SDL_Event *ev) {
       if (g_cheat_open) {
         g_cheat_sel = 0;
         g_cheat_ghost = sw_ghost_current();
+        sw_aff_load();
         g_cheat_status[0] = 0;
       }
     }
@@ -1260,6 +1319,25 @@ static int sw_handle_cheat_pad(SDL_Event *ev) {
     else if (btn == SDL_CONTROLLER_BUTTON_DPAD_RIGHT &&
              g_cheat_sel == SW_CHEAT_GHOST)
       g_cheat_ghost = (g_cheat_ghost + 1) % SW_GHOST_N;
+    else if (btn == SDL_CONTROLLER_BUTTON_DPAD_LEFT &&
+             (g_cheat_sel == SW_CHEAT_XUE || g_cheat_sel == SW_CHEAT_YUER)) {
+      int *v = &g_cheat_aff[g_cheat_sel == SW_CHEAT_YUER];
+      if (*v < 0)
+        *v = 0;
+      else if (*v > 0)
+        (*v)--;
+      else
+        *v = SW_AFF_MAX;
+    } else if (btn == SDL_CONTROLLER_BUTTON_DPAD_RIGHT &&
+               (g_cheat_sel == SW_CHEAT_XUE || g_cheat_sel == SW_CHEAT_YUER)) {
+      int *v = &g_cheat_aff[g_cheat_sel == SW_CHEAT_YUER];
+      if (*v < 0)
+        *v = 0;
+      else if (*v < SW_AFF_MAX)
+        (*v)++;
+      else
+        *v = 0;
+    }
     else if (btn == SDL_CONTROLLER_BUTTON_A)
       sw_cheat_apply();
     else if (btn == SDL_CONTROLLER_BUTTON_B)
@@ -1343,11 +1421,13 @@ static void sw_cheat_present(void *renderer) {
   SDL_Renderer *r = (SDL_Renderer *)renderer;
   SDL_BlendMode old_bm;
   Uint8 or_, og, ob, oa;
-  int sw, sh, pw, ph, px, py, i;
+  int sw, sh, pw, ph, px, py, i, iy, row;
   SDL_Rect dim, box, hi;
   char gold[64];
-  char item[32];
-  static const char *items[] = {"金钱最大", "全员满血", NULL, NULL, NULL, NULL, NULL, NULL, "关闭"};
+  char item[40];
+  static const char *items[] = {"金钱最大", "全员满血", NULL, NULL, NULL,
+                                NULL,      NULL,       NULL, NULL, NULL,
+                                "关闭"};
   SDL_Color title = {255, 220, 120, 255};
   SDL_Color on = {255, 255, 210, 255};
   SDL_Color off = {210, 200, 180, 255};
@@ -1359,7 +1439,9 @@ static void sw_cheat_present(void *renderer) {
   sw = egl_shim_screen_w > 0 ? egl_shim_screen_w : SW_NATIVE_W;
   sh = egl_shim_screen_h > 0 ? egl_shim_screen_h : SW_NATIVE_H;
   pw = 360;
-  ph = 440;
+  ph = 448;
+  if (ph > sh - 8)
+    ph = sh - 8;
   px = (sw - pw) / 2;
   py = (sh - ph) / 2;
   SDL_GetRenderDrawBlendMode(r, &old_bm);
@@ -1390,7 +1472,8 @@ static void sw_cheat_present(void *renderer) {
   sw_cheat_text(r, px + 24, py + 48, gold, hint);
   for (i = 0; i < SW_CHEAT_N; i++) {
     const char *label;
-    int iy = py + 84 + i * 32;
+    row = 28;
+    iy = py + 76 + i * row;
     if (i == SW_CHEAT_NOENC) {
       snprintf(item, sizeof(item), "不遇敌    %s",
                g_no_encounter ? "开" : "关");
@@ -1415,6 +1498,18 @@ static void sw_cheat_present(void *renderer) {
       snprintf(item, sizeof(item), "设置符鬼  %s",
                sw_ghost_name(g_cheat_ghost));
       label = item;
+    } else if (i == SW_CHEAT_XUE) {
+      if (g_cheat_aff[0] < 0)
+        snprintf(item, sizeof(item), "小雪好感  --");
+      else
+        snprintf(item, sizeof(item), "小雪好感  %d", g_cheat_aff[0]);
+      label = item;
+    } else if (i == SW_CHEAT_YUER) {
+      if (g_cheat_aff[1] < 0)
+        snprintf(item, sizeof(item), "玉儿好感  --");
+      else
+        snprintf(item, sizeof(item), "玉儿好感  %d", g_cheat_aff[1]);
+      label = item;
     } else {
       label = items[i];
     }
@@ -1430,13 +1525,14 @@ static void sw_cheat_present(void *renderer) {
       sw_cheat_text(r, px + 28, iy, label, off);
     }
   }
-  sw_cheat_text(r, px + 24, py + 380,
-                g_cheat_sel == SW_CHEAT_GHOST
-                    ? "A 设置   左右切换   上下选择"
+  sw_cheat_text(r, px + 24, py + ph - 60,
+                (g_cheat_sel == SW_CHEAT_GHOST || g_cheat_sel == SW_CHEAT_XUE ||
+                 g_cheat_sel == SW_CHEAT_YUER)
+                    ? "A 设置   左右调整   上下选择"
                     : "A 确定   B/Y 关闭   上下选择",
                 hint);
   if (g_cheat_status[0] && SDL_GetTicks() < g_cheat_status_until)
-    sw_cheat_text(r, px + 24, py + 406, g_cheat_status, ok);
+    sw_cheat_text(r, px + 24, py + ph - 34, g_cheat_status, ok);
   SDL_SetRenderDrawBlendMode(r, old_bm);
   SDL_SetRenderDrawColor(r, or_, og, ob, oa);
 }
