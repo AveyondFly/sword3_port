@@ -207,18 +207,20 @@ static int sw_in_fight(void);
 
 #define SW_CHEAT_MONEY_MAX 99999999
 #define SW_ROLE_STRIDE     0x34c8
-#define SW_CHEAT_N         11
+#define SW_CHEAT_N         12
 #define SW_CHEAT_MONEY     0
 #define SW_CHEAT_HP        1
 #define SW_CHEAT_NOENC     2
 #define SW_CHEAT_LVUP      3
 #define SW_CHEAT_OHKO      4
 #define SW_CHEAT_CATCH     5
-#define SW_CHEAT_REFINE    6
-#define SW_CHEAT_GHOST     7
-#define SW_CHEAT_XUE       8
-#define SW_CHEAT_YUER      9
-#define SW_CHEAT_CLOSE     10
+#define SW_CHEAT_STEAL     6
+#define SW_CHEAT_REFINE    7
+#define SW_CHEAT_GHOST     8
+#define SW_CHEAT_XUE       9
+#define SW_CHEAT_YUER      10
+#define SW_CHEAT_CLOSE     11
+#define SW_STEAL_ITEM_OFF  140
 #define SW_AFF_XUE_GUID    2
 #define SW_AFF_YUER_GUID   3
 #define SW_AFF_VAR         1
@@ -237,6 +239,7 @@ static int g_lvup_applied;
 static int g_lvup_was_fight;
 static int g_one_hit;
 static int g_catch_ok;
+static int g_steal_ok;
 static int g_refine_ok;
 static char g_cheat_status[64];
 static Uint32 g_cheat_status_until;
@@ -247,6 +250,7 @@ static void (*CalLevel_orig)(void);
 static int (*HitDamage1_orig)(void *, void *);
 static int (*HitDamage3_orig)(void *, void *, short *, short *);
 static int (*CheckObsolt_orig)(void *, void *);
+static int (*CheckStealth_orig)(void *, void *);
 static int (*CheckKeeperEscape_orig)(void *, unsigned short);
 static void (*RootDialog_redraw_orig)(void);
 static int g_on_title;
@@ -687,6 +691,41 @@ static void sw_hook_check_obsolt(void) {
   }
   hook_arm64(fn, (uintptr_t)j_CheckObsolt);
   debugPrintf("[patch] MAN_ROLE::CheckObsolt -> catch/refine toggle\n");
+}
+
+static int j_CheckStealth(void *this, void *target) {
+  void *(*getms)(void *);
+  unsigned char *ms;
+  unsigned short id;
+
+  if (!g_steal_ok)
+    return CheckStealth_orig(this, target);
+  getms = (void *(*)(void *))sw_sym("_ZN4ROLE9GetMsDataEv");
+  if (!getms || !target)
+    return CheckStealth_orig(this, target);
+  ms = getms(target);
+  if (!ms)
+    return CheckStealth_orig(this, target);
+  id = *(unsigned short *)(ms + SW_STEAL_ITEM_OFF);
+  if (!id)
+    return CheckStealth_orig(this, target);
+  *(unsigned short *)(ms + SW_STEAL_ITEM_OFF) = 0;
+  return id;
+}
+
+static void sw_hook_check_stealth(void) {
+  uintptr_t fn = so_find_addr_safe("_ZN8MAN_ROLE13Check_StealthER4ROLE");
+  if (!fn) {
+    debugPrintf("[patch] Check_Stealth not found\n");
+    return;
+  }
+  CheckStealth_orig = sw_make_draw_tramp(fn);
+  if (!CheckStealth_orig) {
+    debugPrintf("[patch] Check_Stealth tramp mmap failed\n");
+    return;
+  }
+  hook_arm64(fn, (uintptr_t)j_CheckStealth);
+  debugPrintf("[patch] MAN_ROLE::Check_Stealth -> steal toggle\n");
 }
 
 static void sw_hook_keeper_escape(void) {
@@ -1163,6 +1202,11 @@ static void sw_cheat_toggle_catch(void) {
   sw_cheat_set_status(g_catch_ok ? "抓怪必成已开" : "抓怪必成已关");
 }
 
+static void sw_cheat_toggle_steal(void) {
+  g_steal_ok = !g_steal_ok;
+  sw_cheat_set_status(g_steal_ok ? "偷窃必成已开" : "偷窃必成已关");
+}
+
 static void sw_cheat_toggle_refine(void) {
   g_refine_ok = !g_refine_ok;
   sw_cheat_set_status(g_refine_ok ? "炼妖必成已开" : "炼妖必成已关");
@@ -1273,6 +1317,8 @@ static void sw_cheat_apply(void) {
     sw_cheat_toggle_ohko();
   else if (g_cheat_sel == SW_CHEAT_CATCH)
     sw_cheat_toggle_catch();
+  else if (g_cheat_sel == SW_CHEAT_STEAL)
+    sw_cheat_toggle_steal();
   else if (g_cheat_sel == SW_CHEAT_REFINE)
     sw_cheat_toggle_refine();
   else if (g_cheat_sel == SW_CHEAT_GHOST)
@@ -1427,7 +1473,7 @@ static void sw_cheat_present(void *renderer) {
   char item[40];
   static const char *items[] = {"金钱最大", "全员满血", NULL, NULL, NULL,
                                 NULL,      NULL,       NULL, NULL, NULL,
-                                "关闭"};
+                                NULL,      "关闭"};
   SDL_Color title = {255, 220, 120, 255};
   SDL_Color on = {255, 255, 210, 255};
   SDL_Color off = {210, 200, 180, 255};
@@ -1472,8 +1518,8 @@ static void sw_cheat_present(void *renderer) {
   sw_cheat_text(r, px + 24, py + 48, gold, hint);
   for (i = 0; i < SW_CHEAT_N; i++) {
     const char *label;
-    row = 28;
-    iy = py + 76 + i * row;
+    row = 26;
+    iy = py + 74 + i * row;
     if (i == SW_CHEAT_NOENC) {
       snprintf(item, sizeof(item), "不遇敌    %s",
                g_no_encounter ? "开" : "关");
@@ -1489,6 +1535,10 @@ static void sw_cheat_present(void *renderer) {
     } else if (i == SW_CHEAT_CATCH) {
       snprintf(item, sizeof(item), "抓怪必成  %s",
                g_catch_ok ? "开" : "关");
+      label = item;
+    } else if (i == SW_CHEAT_STEAL) {
+      snprintf(item, sizeof(item), "偷窃必成  %s",
+               g_steal_ok ? "开" : "关");
       label = item;
     } else if (i == SW_CHEAT_REFINE) {
       snprintf(item, sizeof(item), "炼妖必成  %s",
@@ -1517,7 +1567,7 @@ static void sw_cheat_present(void *renderer) {
       hi.x = px + 16;
       hi.y = iy - 4;
       hi.w = pw - 32;
-      hi.h = 28;
+      hi.h = 26;
       SDL_SetRenderDrawColor(r, 90, 70, 28, 220);
       SDL_RenderFillRect(r, &hi);
       sw_cheat_text(r, px + 28, iy, label, on);
@@ -1949,6 +1999,7 @@ int main(int argc, char *argv[]) {
   sw_hook_cal_level();
   sw_hook_hit_damage();
   sw_hook_check_obsolt();
+  sw_hook_check_stealth();
   sw_hook_keeper_escape();
   sw_hook_uigamepad();
   sw_hook_title_credit();
