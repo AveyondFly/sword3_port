@@ -1,5 +1,5 @@
 title="轩辕剑3天之痕"
-portname="sword3"
+portname="swd3de"
 ext=""
 description="轩辕剑3天之痕 (Sword3 / SWD3E) — 大宇 Softstar 经典 RPG 的 ARM64 so-loader 移植。纯 SDL2 2D，支持简/繁中文与过场 FMV。游戏原生库(.so)已随包，仅游戏资源 assets/ 需自备（BYO-data）。"
 author="Windstarry / NextOS Ports"

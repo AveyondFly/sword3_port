@@ -1,13 +1,25 @@
 #!/usr/bin/env bash
 #
-# package_portmaster.sh — 把构建产物 + 启动脚本 + 元数据组装成标准 PortMaster 端口，并打包为 zip。
+# package_portmaster.sh — 组装标准 PortMaster 端口并打包为 swd3de.zip。
 #
-# 设计要点：
-#   - sword3 / libbionic_shim.so / liblog.so 必须与启动脚本【同目录】：main.c 的
-#     load_secondary_libs() 用 dirname(argv[0]) 加载这两个 shim，不能放进 libs/ 子目录。
-#   - PortMaster 约定启动脚本名需与 control.txt 的 portname 一致（=sword3 → sword3.sh），
-#     而本仓库启动脚本为 swd3de.sh（游戏名澄清重命名）。故在包内额外生成 sword3.sh 包装，
-#     仅 exec swd3de.sh，文件夹仍叫 sword3（与 swd3de.sh 内 GAMEDIR=/$directory/ports/sword3 一致）。
+# 标准 PortMaster 包结构（解压后整体落设备的 ports/）：
+#   swd3de.zip
+#   ├── swd3de.sh        <- 启动脚本（在 ports/ 根，与端口目录同名）
+#   └── swd3de/          <- 端口目录（即 GAMEDIR）
+#       ├── sword3              loader 二进制（build_docker.sh 产出，git-ignored）
+#       ├── libbionic_shim.so   bionic -> glibc 兼容垫片
+#       ├── liblog.so           Android liblog 最小替身
+#       ├── lib*.so             游戏自带 Android .so（随包，已 LIBC->WEAK patch）
+#       ├── assets/             游戏资源目录（BYO-data，包内仅占位 .gitkeep）
+#       ├── control.txt         PortMaster 元数据
+#       ├── swd3de.gptk         手柄映射（占位）
+#       └── readme.txt          部署说明
+#
+# 约定：
+#   - sword3 / libbionic_shim.so / liblog.so 必须与 swd3de.sh 启动的 loader 同目录：
+#     main.c 的 load_secondary_libs() 用 dirname(argv[0]) 加载这两个 shim，不能放进 libs/ 子目录。
+#   - swd3de.sh 在包根（swd3de/ 之外），其内 GAMEDIR="/$directory/ports/swd3de" 指向下方 swd3de/。
+#   - portname=swd3de（control.txt），故启动入口即 swd3de.sh，无需额外 sword3.sh 包装。
 #   - zip 用 python zipfile 生成，跨平台（runner=ubuntu 有 python3，本地 Windows 可用 python）。
 #
 set -euo pipefail
@@ -19,10 +31,11 @@ case "$(uname -s 2>/dev/null)" in
   MINGW*|MSYS*|CYGWIN*) HERE="$(cygpath -m "$HERE" 2>/dev/null || echo "$HERE")" ;;
 esac
 DIST="$HERE/dist"
-PORT="$DIST/sword3"
+STAGE="$DIST/stage"
+PORT="$STAGE/swd3de"
 PY="$(command -v python3 || command -v python || true)"
 rm -rf "$DIST"
-mkdir -p "$PORT"
+mkdir -p "$PORT/assets"
 
 echo "[*] 收集构建产物（git-ignored，由 build_docker.sh 产出）"
 for f in sword3 libbionic_shim.so liblog.so; do
@@ -46,30 +59,27 @@ for f in "${game_libs[@]}"; do
   cp -f "$f" "$PORT/$(basename "$f")"
 done
 
-echo "[*] 对端口根目录内随包 Android .so 做 LIBC->WEAK patch（幂等，不改动 libs/ 源文件）"
+echo "[*] 对端口目录内游戏 Android .so 做 LIBC->WEAK patch（幂等，不改动 libs/ 源文件）"
 if [ -z "$PY" ]; then
   echo "ERROR: 未找到 python3/python，无法执行 LIBC->WEAK patch" >&2
   exit 1
 fi
 "$PY" "$HERE/tools/patch_libs.py" "$PORT" || true
 
-echo "[*] 收集启动脚本与元数据"
-cp -f "$HERE/swd3de.sh"       "$PORT/swd3de.sh"; chmod +x "$PORT/swd3de.sh"
+echo "[*] 收集端口目录内元数据"
 cp -f "$HERE/control.txt"     "$PORT/control.txt"
 cp -f "$HERE/swd3de.gptk"     "$PORT/swd3de.gptk"
 cp -f "$HERE/PORT_README.txt" "$PORT/readme.txt"
 
-echo "[*] 生成 PortMaster 启动包装 sword3.sh -> swd3de.sh"
-cat > "$PORT/sword3.sh" <<'WRAP'
-#!/bin/bash
-# 由 package_portmaster.sh 生成：PortMaster 约定启动脚本名需与 portname 一致。
-DIR="$(cd "$(dirname "$0")" && pwd)"
-exec "$DIR/swd3de.sh" "$@"
-WRAP
-chmod +x "$PORT/sword3.sh"
+echo "[*] assets/ 占位（BYO-data，包内仅放空目录标记 .gitkeep）"
+: > "$PORT/assets/.gitkeep"
 
-echo "[*] 打包 $PORT -> $DIST/sword3.zip"
-"$PY" - "$PORT" "$DIST/sword3.zip" <<'PY'
+echo "[*] 复制启动脚本 swd3de.sh 到包根（在 swd3de/ 之外）"
+cp -f "$HERE/swd3de.sh" "$STAGE/swd3de.sh"
+chmod +x "$STAGE/swd3de.sh"
+
+echo "[*] 打包 $STAGE -> $DIST/swd3de.zip"
+"$PY" - "$STAGE" "$DIST/swd3de.zip" <<'PY'
 import os, sys, zipfile
 src, out = sys.argv[1], sys.argv[2]
 n = 0
@@ -81,7 +91,7 @@ with zipfile.ZipFile(out, 'w', zipfile.ZIP_DEFLATED) as z:
             info = zipfile.ZipInfo(rel)
             # 强制可执行位：loader 二进制与启动脚本在设备上必须可运行，
             # 与源文件系统是否能记录 +x 解耦（Windows NTFS / 某些镜像无 +x）。
-            if rel == "sword3" or rel.endswith(".sh"):
+            if rel == "swd3de/sword3" or rel.endswith(".sh"):
                 info.external_attr = 0o755 << 16
             else:
                 info.external_attr = 0o644 << 16
@@ -91,4 +101,4 @@ with zipfile.ZipFile(out, 'w', zipfile.ZIP_DEFLATED) as z:
 print("zipped %d files -> %s" % (n, out))
 PY
 
-echo "==> 完成: $DIST/sword3.zip"
+echo "==> 完成: $DIST/swd3de.zip"
