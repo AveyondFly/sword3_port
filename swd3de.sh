@@ -3,14 +3,15 @@
 #
 # 纯 SDL2 2D 游戏。设备侧 SDL2 自动选后端（Mali-450=fbdev,
 # RK3562/Mali-G52=kmsdrm, Mali-G31=wayland）—— 绝不强制 SDL_VIDEODRIVER（项目铁律）。
-# 前置（BYO-data，不入库）：游戏 .so 与 assets/ 由用户自备并放在本目录。布局见 README.md。
+# 前置：游戏自带 Android .so 已随包（libs/ 入库）；assets/ 资源（BYO-data）由用户
+# 自备并放在本目录的 assets/ 下。布局见 README.md。
 #
-# 数据布局（$GAMEDIR）：
+# 数据布局（$GAMEDIR = /$directory/ports/swd3de）：
 #   sword3            <- loader 二进制（build_docker.sh 产出，git-ignored）
 #   libSWD3E.so libSDL2.so libSDL2_image.so libSDL2_mixer.so libSDL2_ttf.so
-#   libsmpeg2.so libhidapi.so libc++_shared.so   <- 游戏自带 Android .so
+#   libsmpeg2.so libhidapi.so libc++_shared.so   <- 游戏自带 Android .so（随包，已 WEAK patch）
 #   assets/           <- 游戏资源（Resource/ Music/ Video/ zh-Hans/ zh-Hant/ ...）
-#   swd3de.sh  <- 本脚本
+#   swd3de.sh  <- 本脚本（部署在 ports/ 根，与 swd3de/ 目录同级）
 
 XDG_DATA_HOME=${XDG_DATA_HOME:-$HOME/.local/share}
 
@@ -34,7 +35,7 @@ CUR_TTY=/dev/tty0
 $ESUDO chmod 666 $CUR_TTY 2>/dev/null
 
 
-GAMEDIR="/$directory/ports/sword3"
+GAMEDIR="/$directory/ports/swd3de"
 cd "$GAMEDIR"
 
 # 缩短绝对路径（修复 isAnySlotExist() 栈 canary 溢出 → abort sig=6）：

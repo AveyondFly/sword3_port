@@ -32,13 +32,14 @@ jobs:
       - name: Build loader (docker, reuse build_docker.sh)
         run: bash build_docker.sh
 
-      # 组装 PortMaster 端口目录并打包为 sword3.zip（跨平台 python zipfile）。
+      # 组装标准 PortMaster 端口并打包为 swd3de.zip（跨平台 python zipfile）：
+      # 包根 swd3de.sh + swd3de/ 端口目录（含 assets/ 占位）。
       - name: Package PortMaster port
         run: bash tools/package_portmaster.sh
 
       - name: Upload port artifact
         uses: actions/upload-artifact@v4
         with:
-          name: sword3-portmaster
-          path: dist/sword3.zip
+          name: swd3de-portmaster
+          path: dist/swd3de.zip
           if-no-files-found: error
