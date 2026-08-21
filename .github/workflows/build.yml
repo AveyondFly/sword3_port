@@ -21,7 +21,11 @@ env:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    # 必须用 arm64 runner：构建镜像 portmaster-builder:aarch64-latest 仅发布 linux/arm64
+    # manifest，amd64 runner（ubuntu-latest）docker run 会报 no matching manifest。
+    # ubuntu-24.04-arm 是 GitHub 官方 arm64 runner，原生匹配镜像，且自带 Docker 引擎
+    # （与 wiliwili_for_aarch64 的 rocknix 任务同款做法，已验证）。
+    runs-on: ubuntu-24.04-arm
     steps:
       - name: Checkout
         uses: actions/checkout@v5
