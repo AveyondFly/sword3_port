@@ -52,11 +52,12 @@ docker run --rm -v "$HERE":/work -w /work "$IMAGE" bash -c '
         -o "$o"
   done
   echo "[*] linking -> sword3"
-  # 链接命令逐字不变（硬约束）：loader 仅链接设备 SDL2/GLES 用于窗口化，
-  # 不链接任何随包游戏库（SDL2_image 等仅运行期 RTLD_GLOBAL）。
+  # 链接命令（硬约束：loader 仅链接设备 SDL2/GLES 用于窗口化，不链接任何随包游戏库；
+  # SDL2_image 等仅运行期 RTLD_GLOBAL）。-lpng 为 libbionic_shim 的 PNG 解码 shim
+  # （shim_png_from_mem 直接调用 libpng API）所需，属 loader 自身依赖，与 SDL2/GLES 同性质。
   $CC -fPIE -pie build/*.o \
       -lSDL2 -lGLESv2 -lGLESv1_CM \
-      -ldl -lm -lpthread -lstdc++ -lgcc_s \
+      -ldl -lm -lpthread -lstdc++ -lgcc_s -lpng \
       -rdynamic -Wl,-rpath,"\$ORIGIN" \
       -o sword3
   echo "[*] stripping"
@@ -73,7 +74,7 @@ docker run --rm -v "$HERE":/work -w /work "$IMAGE" bash -c '
   $CC -c src/libc_compat_shim.c -I src -D_GNU_SOURCE -O2 -fPIC -o build/libc_compat_shim.o
   $CC -shared -fPIC -O2 -fno-omit-frame-pointer -D_GNU_SOURCE \
       -o libbionic_shim.so src/libbionic_shim.c build/libc_compat_shim.o \
-      -Wl,--version-script=src/libbionic_shim.vers -ldl -lpthread -lm
+      -Wl,--version-script=src/libbionic_shim.vers -ldl -lpthread -lm -lpng
   aarch64-linux-gnu-strip libbionic_shim.so || true
   echo "[+] built: $(ls -l libbionic_shim.so | awk "{print \$5}") bytes"
 

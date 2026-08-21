@@ -1,0 +1,9 @@
+# 强制脚本与 CI 配置使用 LF 换行。
+# 本仓库在 Windows 上 core.autocrlf=true，会把 LF 在 checkout 时转成 CRLF，
+# 导致 `./script.sh` 经 shebang 报 "bad interpreter"。CI 以 `bash script.sh` 运行虽可容忍，
+# 但统一 LF 更稳妥，且保证任何 checkout 下脚本均为 LF。
+*.sh text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.txt text eol=lf
+*.md text eol=lf

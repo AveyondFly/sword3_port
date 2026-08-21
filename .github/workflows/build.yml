@@ -1,0 +1,51 @@
+name: Build SWD3E (aarch64) & Package PortMaster
+
+# 触发（测试主路径）：
+#   - push 到 dev 分支自动构建
+#   - workflow_dispatch 可在 Actions 页手动触发（便于反复测试不同提交）
+#   - 对 main 的 PR 也构建，作为合入前校验
+on:
+  push:
+    branches: [dev]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # 与 wiliwili_for_aarch64 同款 PortMaster 构建镜像（公开 ghcr.io，无需登录）。
+  # build_docker.sh 内部以 ${IMAGE:-...} 读取此变量；此处显式声明便于统一管控。
+  IMAGE: ghcr.io/monkeyx-net/portmaster-build-templates/portmaster-builder:aarch64-latest
+
+jobs:
+  build:
+    # 必须用 arm64 runner：构建镜像 portmaster-builder:aarch64-latest 仅发布 linux/arm64
+    # manifest，amd64 runner（ubuntu-latest）docker run 会报 no matching manifest。
+    # ubuntu-24.04-arm 是 GitHub 官方 arm64 runner，原生匹配镜像，且自带 Docker 引擎
+    # （与 wiliwili_for_aarch64 的 rocknix 任务同款做法，已验证）。
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      # 复用 build_docker.sh：脚本内部 docker run 把 $PWD 挂载进镜像编译
+      # （aarch64-linux-gnu-gcc 交叉工具链），产物落回挂载目录（与本地流程零差异）。
+      # 镜像为公开 ghcr.io，参考 wiliwili_for_aarch64 工作流，无需 docker login。
+      - name: Build loader (docker, reuse build_docker.sh)
+        run: bash build_docker.sh
+
+      # 组装标准 PortMaster 端口：包根 swd3de.sh + swd3de/ 端口目录（含 assets/ 占位），
+      # 把 9 个游戏 Android .so（libs/）与 loader+shim 收进端口目录，并对游戏 .so 暂存副本
+      # LIBC->WEAK。产物 dist/swd3de.zip（python zipfile 强制 sword3/*.sh 为 0o755）。
+      - name: Package PortMaster port
+        run: bash tools/package_portmaster.sh
+
+      - name: Upload port artifact
+        uses: actions/upload-artifact@v5
+        with:
+          name: swd3de-portmaster
+          path: dist/swd3de.zip
+          if-no-files-found: error
+          retention-days: 7

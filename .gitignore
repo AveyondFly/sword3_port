@@ -1,12 +1,19 @@
-# 构建产物（二进制，不入库，仅提交源码）
+# 构建产物（引擎二进制，由 build_docker.sh 生成，不入库；CI 产物经 artifact 分发）
 sword3
 libbionic_shim.so
 liblog.so
 build/
 deploy/
+dist/
 
-# 游戏自带数据（BYO-data，不入库）
+# 游戏自带 Android .so：随包、需 LIBC->WEAK patch，由本地提供并【入库】（置于 libs/）。
+# 根目录的引擎 shim（libbionic_shim.so/liblog.so）已由上方显式忽略；
+# 全局 *.so 用于挡住其它散落 .so，再用 !libs/*.so 放行 libs/ 下的游戏 .so。
 *.so
+!libs/
+!libs/*.so
+
+# 游戏资源（assets/：音乐/视频/贴图等大体量数据，BYO-data，不入库）
 assets/
 
 # 设备运行日志（临时，不入库；手动跑游戏会存回本目录）
